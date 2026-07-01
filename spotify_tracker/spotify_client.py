@@ -43,7 +43,13 @@ class SpotifyClient:
 
         headers = {"Authorization": f"Bearer {self._get_token()}"}
         response = requests.get(url, headers=headers, params=params, timeout=15)
-        response.raise_for_status()
+        if not response.ok:
+            # Surface Spotify's actual error body instead of a bare "400 Bad Request",
+            # since that's usually the only clue as to what it didn't like.
+            raise requests.exceptions.HTTPError(
+                f"{response.status_code} error for url {response.url}: {response.text}",
+                response=response,
+            )
         return response.json()
 
     def search_artist(self, name: str) -> dict | None:
@@ -56,7 +62,7 @@ class SpotifyClient:
         """Return every album/single released under this artist, newest first."""
         releases: list[dict] = []
         url = f"{API_BASE}/artists/{artist_id}/albums"
-        params = {"include_groups": "album,single", "limit": 50}
+        params = {"include_groups": "album,single", "limit": 50, "market": "US"}
 
         while url:
             data = self._get(url, params=params)
