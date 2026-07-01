@@ -1,0 +1,4 @@
+# One artist name per line. Lines starting with # are ignored.
+TAFF
+OAIWJDIOAWDJA
+Zaf
