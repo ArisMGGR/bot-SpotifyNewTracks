@@ -1,0 +1,82 @@
+"""One-time OAuth Authorization Code flow to obtain a Spotify user refresh token.
+
+This is only needed for endpoints that read the logged-in user's own data
+(like their followed artists) which client-credentials app tokens can't see.
+"""
+
+import secrets
+import urllib.parse
+import webbrowser
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+import requests
+
+AUTHORIZE_URL = "https://accounts.spotify.com/authorize"
+TOKEN_URL = "https://accounts.spotify.com/api/token"
+SCOPE = "user-follow-read"
+
+
+class _CallbackHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        query = urllib.parse.urlparse(self.path).query
+        params = urllib.parse.parse_qs(query)
+        self.server.auth_code = params.get("code", [None])[0]  # type: ignore[attr-defined]
+        self.server.auth_error = params.get("error", [None])[0]  # type: ignore[attr-defined]
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+        if self.server.auth_code:  # type: ignore[attr-defined]
+            self.wfile.write(b"<h1>Login successful</h1>You can close this tab and return to the terminal.")
+        else:
+            self.wfile.write(b"<h1>Login failed</h1>Check the terminal for details.")
+
+    def log_message(self, format: str, *args) -> None:
+        pass  # silence the default per-request access log
+
+
+def _wait_for_callback(port: int) -> tuple[str | None, str | None]:
+    server = HTTPServer(("127.0.0.1", port), _CallbackHandler)
+    server.auth_code = None  # type: ignore[attr-defined]
+    server.auth_error = None  # type: ignore[attr-defined]
+    server.handle_request()  # blocks until the redirect hits this server, then stops
+    return server.auth_code, server.auth_error  # type: ignore[attr-defined]
+
+
+def run_login_flow(client_id: str, client_secret: str, redirect_uri: str) -> str:
+    """Runs the browser login flow and returns a long-lived refresh token."""
+    port = urllib.parse.urlparse(redirect_uri).port or 80
+    state = secrets.token_urlsafe(16)
+
+    auth_url = AUTHORIZE_URL + "?" + urllib.parse.urlencode(
+        {
+            "client_id": client_id,
+            "response_type": "code",
+            "redirect_uri": redirect_uri,
+            "scope": SCOPE,
+            "state": state,
+        }
+    )
+
+    print(f"Opening your browser to authorize this app:\n{auth_url}\n")
+    webbrowser.open(auth_url)
+
+    code, error = _wait_for_callback(port)
+    if error or not code:
+        raise SystemExit(f"Spotify authorization failed: {error or 'no code returned'}")
+
+    response = requests.post(
+        TOKEN_URL,
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": redirect_uri,
+        },
+        auth=(client_id, client_secret),
+        timeout=15,
+    )
+    response.raise_for_status()
+    refresh_token = response.json().get("refresh_token")
+    if not refresh_token:
+        raise SystemExit("Spotify did not return a refresh token.")
+    return refresh_token
