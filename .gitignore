@@ -1,0 +1,7 @@
+.env
+state.json
+artists.txt
+__pycache__/
+*.pyc
+.venv/
+venv/
