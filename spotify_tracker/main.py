@@ -20,16 +20,25 @@ def check_artists(spotify: SpotifyClient, telegram: TelegramNotifier, state: Sta
         logger.warning("Spotify returned no followed artists for this account.")
         return
 
+    logger.info("Checking %d followed artists", len(artists))
     for artist in artists:
         artist_id = artist["id"]
         display_name = artist["name"]
-        releases = spotify.get_artist_releases(artist_id)
+        try:
+            releases = spotify.get_artist_releases(artist_id)
+        except Exception:
+            # One artist failing (e.g. persistent rate limit) shouldn't kill
+            # the whole run; the next run will pick this artist up again.
+            logger.exception("Failed to fetch releases for %s; skipping", display_name)
+            continue
+
         current_ids = {release["id"] for release in releases}
 
         if not state.has_artist(artist_id):
             # First time we see this artist: record a baseline instead of
             # notifying about their entire back catalog.
             state.set_release_ids(artist_id, current_ids)
+            state.save()
             logger.info("Baseline recorded for %s (%d releases)", display_name, len(current_ids))
             continue
 
@@ -48,6 +57,7 @@ def check_artists(spotify: SpotifyClient, telegram: TelegramNotifier, state: Sta
             logger.info("Notified about new release: %s - %s", display_name, release["name"])
 
         state.set_release_ids(artist_id, current_ids)
+        state.save()
 
 
 def main() -> None:

@@ -8,12 +8,22 @@ Uses two separate token types:
   such as the list of artists they follow.
 """
 
+import logging
 import time
 
 import requests
 
+logger = logging.getLogger("spotify_tracker")
+
 TOKEN_URL = "https://accounts.spotify.com/api/token"
 API_BASE = "https://api.spotify.com/v1"
+
+# Spacing between API requests plus 429 back-off handling. Development Mode
+# apps have a low rate limit, and checking many followed artists means one
+# albums request per artist (paginated 10 at a time).
+MIN_REQUEST_INTERVAL = 0.6  # seconds
+MAX_RATE_LIMIT_RETRIES = 3
+MAX_RATE_LIMIT_WAIT = 120  # seconds; give up rather than sleep for hours
 
 
 class SpotifyClient:
@@ -25,6 +35,7 @@ class SpotifyClient:
         self._app_token_expiry = 0.0
         self._user_token = None
         self._user_token_expiry = 0.0
+        self._last_request_at = 0.0
 
     def _get_app_token(self) -> str:
         if self._app_token and time.time() < self._app_token_expiry:
@@ -64,17 +75,40 @@ class SpotifyClient:
         else:
             url = f"{API_BASE}{url_or_path}"
 
-        token = self._get_user_token() if auth == "user" else self._get_app_token()
-        headers = {"Authorization": f"Bearer {token}"}
-        response = requests.get(url, headers=headers, params=params, timeout=15)
-        if not response.ok:
-            # Surface Spotify's actual error body instead of a bare "400 Bad Request",
-            # since that's usually the only clue as to what it didn't like.
-            raise requests.exceptions.HTTPError(
-                f"{response.status_code} error for url {response.url}: {response.text}",
-                response=response,
-            )
-        return response.json()
+        for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
+            # Keep a minimum gap between requests so a big followed-artists
+            # list doesn't burst straight into Spotify's rate limit.
+            elapsed = time.time() - self._last_request_at
+            if elapsed < MIN_REQUEST_INTERVAL:
+                time.sleep(MIN_REQUEST_INTERVAL - elapsed)
+
+            token = self._get_user_token() if auth == "user" else self._get_app_token()
+            headers = {"Authorization": f"Bearer {token}"}
+            response = requests.get(url, headers=headers, params=params, timeout=15)
+            self._last_request_at = time.time()
+
+            if response.status_code == 429 and attempt < MAX_RATE_LIMIT_RETRIES:
+                # Spotify says how long to back off in the Retry-After header.
+                try:
+                    wait = int(response.headers.get("Retry-After", "5"))
+                except ValueError:
+                    wait = 5
+                wait = min(wait + 1, MAX_RATE_LIMIT_WAIT)
+                logger.warning("Rate limited by Spotify; waiting %ds before retrying", wait)
+                time.sleep(wait)
+                continue
+
+            if not response.ok:
+                # Surface Spotify's actual error body instead of a bare "400 Bad
+                # Request", since that's usually the only clue as to what it
+                # didn't like.
+                raise requests.exceptions.HTTPError(
+                    f"{response.status_code} error for url {response.url}: {response.text}",
+                    response=response,
+                )
+            return response.json()
+
+        raise requests.exceptions.HTTPError(f"Still rate limited after retries: {url}")
 
     def get_followed_artists(self) -> list[dict]:
         """Return every artist the logged-in user follows."""
