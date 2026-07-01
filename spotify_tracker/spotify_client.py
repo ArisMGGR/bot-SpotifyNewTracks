@@ -62,7 +62,9 @@ class SpotifyClient:
         """Return every album/single released under this artist, newest first."""
         releases: list[dict] = []
         url = f"{API_BASE}/artists/{artist_id}/albums"
-        params = {"include_groups": "album,single", "limit": 20, "market": "US"}
+        # Spotify's February 2026 Development Mode changes lowered the max
+        # page size for catalog endpoints from 50 down to 10.
+        params = {"include_groups": "album,single", "limit": 10, "market": "US"}
 
         while url:
             data = self._get(url, params=params)
