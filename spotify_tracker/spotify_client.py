@@ -62,7 +62,7 @@ class SpotifyClient:
         """Return every album/single released under this artist, newest first."""
         releases: list[dict] = []
         url = f"{API_BASE}/artists/{artist_id}/albums"
-        params = {"include_groups": "album,single", "limit": 50, "market": "US"}
+        params = {"include_groups": "album,single", "limit": 20, "market": "US"}
 
         while url:
             data = self._get(url, params=params)
