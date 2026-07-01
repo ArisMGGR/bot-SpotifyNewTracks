@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 
 from spotify_tracker.config import load_config
-from spotify_tracker.spotify_client import SpotifyClient
+from spotify_tracker.spotify_client import SpotifyClient, SpotifyRateLimitError
 from spotify_tracker.state import StateStore
 from spotify_tracker.telegram import TelegramNotifier
 
@@ -15,7 +15,14 @@ logger = logging.getLogger("spotify_tracker")
 
 
 def check_artists(spotify: SpotifyClient, telegram: TelegramNotifier, state: StateStore) -> None:
-    artists = spotify.get_followed_artists()
+    try:
+        artists = spotify.get_followed_artists()
+    except SpotifyRateLimitError as err:
+        logger.warning(
+            "Spotify rate limit hit while listing followed artists (retry after %ds); skipping this run",
+            err.retry_after,
+        )
+        return
     if not artists:
         logger.warning("Spotify returned no followed artists for this account.")
         return
@@ -25,10 +32,20 @@ def check_artists(spotify: SpotifyClient, telegram: TelegramNotifier, state: Sta
         artist_id = artist["id"]
         display_name = artist["name"]
         try:
-            releases = spotify.get_artist_releases(artist_id)
+            releases = spotify.get_latest_releases(artist_id)
+        except SpotifyRateLimitError as err:
+            # Any further request during the penalty window extends it, so
+            # stop here; already-checked artists are saved and the rest get
+            # picked up next run.
+            logger.warning(
+                "Spotify rate limit hit (retry after %ds); stopping this run early at %s",
+                err.retry_after,
+                display_name,
+            )
+            return
         except Exception:
-            # One artist failing (e.g. persistent rate limit) shouldn't kill
-            # the whole run; the next run will pick this artist up again.
+            # One artist failing shouldn't kill the whole run; the next run
+            # will pick this artist up again.
             logger.exception("Failed to fetch releases for %s; skipping", display_name)
             continue
 
@@ -56,7 +73,9 @@ def check_artists(spotify: SpotifyClient, telegram: TelegramNotifier, state: Sta
             telegram.send_message(message)
             logger.info("Notified about new release: %s - %s", display_name, release["name"])
 
-        state.set_release_ids(artist_id, current_ids)
+        # Merge rather than replace: we only fetch the newest page now, so
+        # older IDs must stay known to avoid re-notifying about them later.
+        state.set_release_ids(artist_id, known_ids | current_ids)
         state.save()
 
 

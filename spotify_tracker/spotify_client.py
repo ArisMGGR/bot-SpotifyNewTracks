@@ -20,10 +20,22 @@ API_BASE = "https://api.spotify.com/v1"
 
 # Spacing between API requests plus 429 back-off handling. Development Mode
 # apps have a low rate limit, and checking many followed artists means one
-# albums request per artist (paginated 10 at a time).
-MIN_REQUEST_INTERVAL = 0.6  # seconds
-MAX_RATE_LIMIT_RETRIES = 3
-MAX_RATE_LIMIT_WAIT = 120  # seconds; give up rather than sleep for hours
+# albums request per artist.
+MIN_REQUEST_INTERVAL = 1.0  # seconds
+MAX_RATE_LIMIT_RETRIES = 2
+MAX_RATE_LIMIT_WAIT = 60  # seconds
+
+
+class SpotifyRateLimitError(Exception):
+    """Raised when Spotify's rate-limit penalty is too long to wait out.
+
+    Retrying while the penalty window is active only extends it, so the
+    caller should abort the whole run and try again later.
+    """
+
+    def __init__(self, retry_after: int):
+        self.retry_after = retry_after
+        super().__init__(f"Spotify rate limit active; retry after {retry_after}s")
 
 
 class SpotifyClient:
@@ -87,15 +99,18 @@ class SpotifyClient:
             response = requests.get(url, headers=headers, params=params, timeout=15)
             self._last_request_at = time.time()
 
-            if response.status_code == 429 and attempt < MAX_RATE_LIMIT_RETRIES:
+            if response.status_code == 429:
                 # Spotify says how long to back off in the Retry-After header.
                 try:
                     wait = int(response.headers.get("Retry-After", "5"))
                 except ValueError:
                     wait = 5
-                wait = min(wait + 1, MAX_RATE_LIMIT_WAIT)
-                logger.warning("Rate limited by Spotify; waiting %ds before retrying", wait)
-                time.sleep(wait)
+                if wait > MAX_RATE_LIMIT_WAIT or attempt >= MAX_RATE_LIMIT_RETRIES:
+                    # The penalty is too long to wait out (it can run to many
+                    # minutes), and retrying during it only extends it.
+                    raise SpotifyRateLimitError(wait)
+                logger.warning("Rate limited by Spotify; waiting %ds before retrying", wait + 1)
+                time.sleep(wait + 1)
                 continue
 
             if not response.ok:
@@ -108,7 +123,7 @@ class SpotifyClient:
                 )
             return response.json()
 
-        raise requests.exceptions.HTTPError(f"Still rate limited after retries: {url}")
+        raise AssertionError("unreachable")  # loop always returns or raises
 
     def get_followed_artists(self) -> list[dict]:
         """Return every artist the logged-in user follows."""
@@ -125,19 +140,18 @@ class SpotifyClient:
 
         return artists
 
-    def get_artist_releases(self, artist_id: str) -> list[dict]:
-        """Return every album/single released under this artist, newest first."""
-        releases: list[dict] = []
-        url = f"{API_BASE}/artists/{artist_id}/albums"
-        # Spotify's February 2026 Development Mode changes lowered the max
-        # page size for catalog endpoints from 50 down to 10.
-        params = {"include_groups": "album,single", "limit": 10, "market": "US"}
+    def get_latest_releases(self, artist_id: str) -> list[dict]:
+        """Return the artist's most recent albums/singles (one page).
 
-        while url:
-            data = self._get(url, params=params)
-            releases.extend(data.get("items", []))
-            url = data.get("next")
-            params = None  # "next" already contains the query string
-
+        Detecting a new release only requires the newest items, and fetching
+        the full catalog cost several requests per artist — enough to trip
+        Spotify's Development Mode rate limit across a large followed list.
+        (The Feb 2026 Dev Mode changes also cap the page size at 10.)
+        """
+        data = self._get(
+            f"/artists/{artist_id}/albums",
+            params={"include_groups": "album,single", "limit": 10, "market": "US"},
+        )
+        releases = data.get("items", [])
         releases.sort(key=lambda r: r.get("release_date", ""), reverse=True)
         return releases
