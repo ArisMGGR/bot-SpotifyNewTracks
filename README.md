@@ -1,7 +1,7 @@
 # Spotify New Tracks Notifier
 
-Watches a list of Spotify artists and sends you a Telegram message whenever
-one of them releases a new album or single.
+Watches the artists you follow on Spotify and sends you a Telegram message
+whenever one of them releases a new album or single.
 
 ## Setup
 
@@ -10,9 +10,12 @@ one of them releases a new album or single.
    pip install -r requirements.txt
    ```
 
-2. **Create a Spotify app** at https://developer.spotify.com/dashboard to get
-   a `Client ID` and `Client Secret`. No user login/redirect URI is needed —
-   this project only reads public artist data.
+2. **Create a Spotify app** at https://developer.spotify.com/dashboard:
+   - Click **Create app**, fill in any name/description.
+   - Under **Redirect URIs**, add exactly: `http://127.0.0.1:8888/callback`
+   - Check **Web API** and save.
+   - On the app's **Settings** page, copy the **Client ID** and (after
+     clicking "View client secret") the **Client secret**.
 
 3. **Create a Telegram bot**: message [@BotFather](https://t.me/BotFather),
    run `/newbot`, and copy the bot token it gives you.
@@ -21,17 +24,19 @@ one of them releases a new album or single.
    `https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates` in a browser and
    read the `chat.id` field from the response.
 
-5. **Configure secrets**: copy `.env.example` to `.env` and fill in the four
-   values:
+5. **Configure secrets**: copy `.env.example` to `.env` and fill in
+   `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, `TELEGRAM_BOT_TOKEN`,
+   `TELEGRAM_CHAT_ID`:
    ```bash
    cp .env.example .env
    ```
 
-6. **List the artists you want to track**: copy `artists.example.txt` to
-   `artists.txt` and put one artist name per line:
+6. **Authorize the app to read your followed artists** (one-time):
    ```bash
-   cp artists.example.txt artists.txt
+   python -m spotify_tracker.login
    ```
+   This opens your browser to log in and approve access, then saves
+   `SPOTIFY_REFRESH_TOKEN` into `.env` automatically.
 
 ## Usage
 
@@ -45,14 +50,12 @@ Or keep it running and poll every N seconds (e.g. every hour):
 python -m spotify_tracker.main --interval 3600
 ```
 
-Other options:
-```bash
-python -m spotify_tracker.main --artists-file my_artists.txt --state-file my_state.json
-```
-
 ### How it works
 
-- Artist names are resolved to Spotify artist IDs via the Spotify search API.
+- On each run, the program fetches every artist your Spotify account
+  follows (`GET /me/following`), so there's no name list to maintain —
+  following/unfollowing an artist in Spotify is how you manage what's
+  tracked.
 - Each artist's albums/singles are fetched and compared against
   `state.json`, which remembers release IDs already seen.
 - The first time an artist is checked, its current catalog is recorded as a

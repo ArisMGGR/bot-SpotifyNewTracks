@@ -1,4 +1,4 @@
-"""Entry point: reads artist names from a .txt file and notifies on new releases."""
+"""Entry point: checks the artists you follow on Spotify and notifies on new releases."""
 
 import argparse
 import logging
@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 
 from spotify_tracker.config import load_config
-from spotify_tracker.spotify_client import SpotifyClient
+from spotify_tracker.spotify_client import SpotifyClient, SpotifyRateLimitError
 from spotify_tracker.state import StateStore
 from spotify_tracker.telegram import TelegramNotifier
 
@@ -14,36 +14,48 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("spotify_tracker")
 
 
-def read_artist_names(path: Path) -> list[str]:
-    names = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        name = line.strip()
-        if name and not name.startswith("#"):
-            names.append(name)
-    return names
+def check_artists(spotify: SpotifyClient, telegram: TelegramNotifier, state: StateStore) -> None:
+    try:
+        artists = spotify.get_followed_artists()
+    except SpotifyRateLimitError as err:
+        logger.warning(
+            "Spotify rate limit hit while listing followed artists (retry after %ds); skipping this run",
+            err.retry_after,
+        )
+        return
+    if not artists:
+        logger.warning("Spotify returned no followed artists for this account.")
+        return
 
-
-def check_artists(
-    spotify: SpotifyClient,
-    telegram: TelegramNotifier,
-    state: StateStore,
-    artist_names: list[str],
-) -> None:
-    for name in artist_names:
-        artist = spotify.search_artist(name)
-        if artist is None:
-            logger.warning("Could not find artist on Spotify: %s", name)
-            continue
-
+    logger.info("Checking %d followed artists", len(artists))
+    for artist in artists:
         artist_id = artist["id"]
         display_name = artist["name"]
-        releases = spotify.get_artist_releases(artist_id)
+        try:
+            releases = spotify.get_latest_releases(artist_id)
+        except SpotifyRateLimitError as err:
+            # Any further request during the penalty window extends it, so
+            # stop here; already-checked artists are saved and the rest get
+            # picked up next run.
+            logger.warning(
+                "Spotify rate limit hit (retry after %ds); stopping this run early at %s",
+                err.retry_after,
+                display_name,
+            )
+            return
+        except Exception:
+            # One artist failing shouldn't kill the whole run; the next run
+            # will pick this artist up again.
+            logger.exception("Failed to fetch releases for %s; skipping", display_name)
+            continue
+
         current_ids = {release["id"] for release in releases}
 
         if not state.has_artist(artist_id):
             # First time we see this artist: record a baseline instead of
             # notifying about their entire back catalog.
             state.set_release_ids(artist_id, current_ids)
+            state.save()
             logger.info("Baseline recorded for %s (%d releases)", display_name, len(current_ids))
             continue
 
@@ -61,17 +73,15 @@ def check_artists(
             telegram.send_message(message)
             logger.info("Notified about new release: %s - %s", display_name, release["name"])
 
-        state.set_release_ids(artist_id, current_ids)
+        # Merge rather than replace: we only fetch the newest page now, so
+        # older IDs must stay known to avoid re-notifying about them later.
+        state.set_release_ids(artist_id, known_ids | current_ids)
+        state.save()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Track Spotify artists and send a Telegram alert when they release new music."
-    )
-    parser.add_argument(
-        "--artists-file",
-        default="artists.txt",
-        help="Path to a .txt file with one artist name per line (default: artists.txt).",
+        description="Track the artists you follow on Spotify and send a Telegram alert when they release new music."
     )
     parser.add_argument(
         "--state-file",
@@ -87,20 +97,12 @@ def main() -> None:
     args = parser.parse_args()
 
     config = load_config()
-    spotify = SpotifyClient(config.spotify_client_id, config.spotify_client_secret)
+    spotify = SpotifyClient(config.spotify_client_id, config.spotify_client_secret, config.spotify_refresh_token)
     telegram = TelegramNotifier(config.telegram_bot_token, config.telegram_chat_id)
     state = StateStore(Path(args.state_file))
 
-    artists_path = Path(args.artists_file)
-    if not artists_path.exists():
-        raise SystemExit(f"Artists file not found: {artists_path}")
-
     def run_once() -> None:
-        artist_names = read_artist_names(artists_path)
-        if not artist_names:
-            logger.warning("No artist names found in %s", artists_path)
-            return
-        check_artists(spotify, telegram, state, artist_names)
+        check_artists(spotify, telegram, state)
         state.save()
 
     if args.interval > 0:
