@@ -14,12 +14,39 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("spotify_tracker")
 
 
+FOLLOWED_CACHE_MAX_AGE = 24 * 3600  # refresh the followed-artists list daily
+
+
+def get_artists_to_check(spotify: SpotifyClient, state: StateStore) -> list[dict]:
+    """Followed artists, most-overdue first, from cache when fresh enough."""
+    artists = state.cached_followed_artists(FOLLOWED_CACHE_MAX_AGE)
+    if artists is None:
+        try:
+            artists = spotify.get_followed_artists()
+            state.set_followed_artists(artists)
+            state.save()
+            logger.info("Refreshed followed-artists list (%d artists)", len(artists))
+        except SpotifyRateLimitError as err:
+            artists = state.any_cached_followed_artists()
+            if artists is None:
+                raise
+            logger.warning(
+                "Rate limited refreshing the followed list (retry after %ds); using cached list",
+                err.retry_after,
+            )
+
+    # Least recently checked first, so short rate-limited runs rotate through
+    # everyone over time instead of rechecking the same few. Never-checked
+    # artists sort first.
+    return sorted(artists, key=lambda a: state.checked_at(a["id"]))
+
+
 def check_artists(spotify: SpotifyClient, telegram: TelegramNotifier, state: StateStore) -> None:
     try:
-        artists = spotify.get_followed_artists()
+        artists = get_artists_to_check(spotify, state)
     except SpotifyRateLimitError as err:
         logger.warning(
-            "Spotify rate limit hit while listing followed artists (retry after %ds); skipping this run",
+            "Spotify rate limit hit and no cached artist list yet (retry after %ds); skipping this run",
             err.retry_after,
         )
         return
@@ -27,7 +54,8 @@ def check_artists(spotify: SpotifyClient, telegram: TelegramNotifier, state: Sta
         logger.warning("Spotify returned no followed artists for this account.")
         return
 
-    logger.info("Checking %d followed artists", len(artists))
+    logger.info("Checking %d followed artists (most overdue first)", len(artists))
+    checked = 0
     for artist in artists:
         artist_id = artist["id"]
         display_name = artist["name"]
@@ -35,12 +63,14 @@ def check_artists(spotify: SpotifyClient, telegram: TelegramNotifier, state: Sta
             releases = spotify.get_latest_releases(artist_id)
         except SpotifyRateLimitError as err:
             # Any further request during the penalty window extends it, so
-            # stop here; already-checked artists are saved and the rest get
-            # picked up next run.
+            # stop here; already-checked artists are saved and the next run
+            # starts with the ones we didn't reach.
             logger.warning(
-                "Spotify rate limit hit (retry after %ds); stopping this run early at %s",
+                "Spotify rate limit hit (retry after %ds); stopping early: %d/%d artists checked, %d remaining",
                 err.retry_after,
-                display_name,
+                checked,
+                len(artists),
+                len(artists) - checked,
             )
             return
         except Exception:
@@ -54,8 +84,9 @@ def check_artists(spotify: SpotifyClient, telegram: TelegramNotifier, state: Sta
         if not state.has_artist(artist_id):
             # First time we see this artist: record a baseline instead of
             # notifying about their entire back catalog.
-            state.set_release_ids(artist_id, current_ids)
+            state.record_check(artist_id, display_name, current_ids)
             state.save()
+            checked += 1
             logger.info("Baseline recorded for %s (%d releases)", display_name, len(current_ids))
             continue
 
@@ -75,8 +106,11 @@ def check_artists(spotify: SpotifyClient, telegram: TelegramNotifier, state: Sta
 
         # Merge rather than replace: we only fetch the newest page now, so
         # older IDs must stay known to avoid re-notifying about them later.
-        state.set_release_ids(artist_id, known_ids | current_ids)
+        state.record_check(artist_id, display_name, known_ids | current_ids)
         state.save()
+        checked += 1
+
+    logger.info("Run complete: checked all %d artists", checked)
 
 
 def main() -> None:
