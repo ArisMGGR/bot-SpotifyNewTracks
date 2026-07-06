@@ -5,12 +5,28 @@ import logging
 import time
 from pathlib import Path
 
+from tqdm import tqdm
+
 from spotify_tracker.config import load_config
 from spotify_tracker.spotify_client import SpotifyClient, SpotifyRateLimitError
 from spotify_tracker.state import StateStore
 from spotify_tracker.telegram import TelegramNotifier
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+class TqdmLoggingHandler(logging.Handler):
+    """Writes log lines via tqdm so they appear above an active progress bar
+    instead of mangling it."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            tqdm.write(self.format(record))
+        except Exception:
+            self.handleError(record)
+
+
+_handler = TqdmLoggingHandler()
+_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+logging.basicConfig(level=logging.INFO, handlers=[_handler])
 logger = logging.getLogger("spotify_tracker")
 
 
@@ -56,59 +72,62 @@ def check_artists(spotify: SpotifyClient, telegram: TelegramNotifier, state: Sta
 
     logger.info("Checking %d followed artists (most overdue first)", len(artists))
     checked = 0
-    for artist in artists:
-        artist_id = artist["id"]
-        display_name = artist["name"]
-        try:
-            releases = spotify.get_latest_releases(artist_id)
-        except SpotifyRateLimitError as err:
-            # Any further request during the penalty window extends it, so
-            # stop here; already-checked artists are saved and the next run
-            # starts with the ones we didn't reach.
-            logger.warning(
-                "Spotify rate limit hit (retry after %ds); stopping early: %d/%d artists checked, %d remaining",
-                err.retry_after,
-                checked,
-                len(artists),
-                len(artists) - checked,
-            )
-            return
-        except Exception:
-            # One artist failing shouldn't kill the whole run; the next run
-            # will pick this artist up again.
-            logger.exception("Failed to fetch releases for %s; skipping", display_name)
-            continue
+    with tqdm(artists, desc="Checking artists", unit="artist") as progress:
+        for artist in progress:
+            artist_id = artist["id"]
+            display_name = artist["name"]
+            progress.set_postfix_str(display_name)
+            try:
+                releases = spotify.get_latest_releases(artist_id)
+            except SpotifyRateLimitError as err:
+                # Any further request during the penalty window extends it, so
+                # stop here; already-checked artists are saved and the next run
+                # starts with the ones we didn't reach.
+                progress.close()
+                logger.warning(
+                    "Spotify rate limit hit (retry after %ds); stopping early: %d/%d artists checked, %d remaining",
+                    err.retry_after,
+                    checked,
+                    len(artists),
+                    len(artists) - checked,
+                )
+                return
+            except Exception:
+                # One artist failing shouldn't kill the whole run; the next run
+                # will pick this artist up again.
+                logger.exception("Failed to fetch releases for %s; skipping", display_name)
+                continue
 
-        current_ids = {release["id"] for release in releases}
+            current_ids = {release["id"] for release in releases}
 
-        if not state.has_artist(artist_id):
-            # First time we see this artist: record a baseline instead of
-            # notifying about their entire back catalog.
-            state.record_check(artist_id, display_name, current_ids)
+            if not state.has_artist(artist_id):
+                # First time we see this artist: record a baseline instead of
+                # notifying about their entire back catalog.
+                state.record_check(artist_id, display_name, current_ids)
+                state.save()
+                checked += 1
+                logger.info("Baseline recorded for %s (%d releases)", display_name, len(current_ids))
+                continue
+
+            known_ids = state.known_release_ids(artist_id)
+            new_releases = [r for r in releases if r["id"] not in known_ids]
+
+            for release in new_releases:
+                release_kind = release.get("album_group") or release.get("album_type") or "release"
+                message = (
+                    f"\U0001F3B5 <b>{display_name}</b> just released:\n"
+                    f"<b>{release['name']}</b> ({release_kind})\n"
+                    f"Released: {release.get('release_date', 'unknown')}\n"
+                    f"{release.get('external_urls', {}).get('spotify', '')}"
+                )
+                telegram.send_message(message)
+                logger.info("Notified about new release: %s - %s", display_name, release["name"])
+
+            # Merge rather than replace: we only fetch the newest page now, so
+            # older IDs must stay known to avoid re-notifying about them later.
+            state.record_check(artist_id, display_name, known_ids | current_ids)
             state.save()
             checked += 1
-            logger.info("Baseline recorded for %s (%d releases)", display_name, len(current_ids))
-            continue
-
-        known_ids = state.known_release_ids(artist_id)
-        new_releases = [r for r in releases if r["id"] not in known_ids]
-
-        for release in new_releases:
-            release_kind = release.get("album_group") or release.get("album_type") or "release"
-            message = (
-                f"\U0001F3B5 <b>{display_name}</b> just released:\n"
-                f"<b>{release['name']}</b> ({release_kind})\n"
-                f"Released: {release.get('release_date', 'unknown')}\n"
-                f"{release.get('external_urls', {}).get('spotify', '')}"
-            )
-            telegram.send_message(message)
-            logger.info("Notified about new release: %s - %s", display_name, release["name"])
-
-        # Merge rather than replace: we only fetch the newest page now, so
-        # older IDs must stay known to avoid re-notifying about them later.
-        state.record_check(artist_id, display_name, known_ids | current_ids)
-        state.save()
-        checked += 1
 
     logger.info("Run complete: checked all %d artists", checked)
 
