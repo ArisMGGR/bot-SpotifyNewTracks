@@ -60,7 +60,9 @@ python -m spotify_tracker.main --interval 3600
   catalog is fetched and recorded as a baseline (no notification), so you
   don't get flooded with their back catalog and old releases can't later be
   mistaken for new ones. If a rate limit interrupts the fetch, nothing is
-  recorded and the next run retries that artist.
+  recorded and the next run retries that artist. After each baseline the
+  tool cools down for a few seconds (proportional to the catalog size) so
+  back-to-back baselines don't trip Spotify's rate limit.
 - On every later check only the newest page of releases is fetched and
   compared against `state.json`, which remembers release IDs already seen.
 - Only unseen releases dated within the last 30 days trigger a Telegram

@@ -3,6 +3,7 @@
 import argparse
 import calendar
 import logging
+import math
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -38,6 +39,19 @@ FOLLOWED_CACHE_MAX_AGE = 24 * 3600  # refresh the followed-artists list daily
 # as "unseen" is Spotify catalog noise (relinked/duplicate IDs, regional
 # editions, availability changes), not a new release — absorb it silently.
 NOTIFY_MAX_AGE_DAYS = 30
+
+
+# Baselining an artist fetches their whole catalog in one burst (one request
+# per 10 releases). Spotify's limit is a rolling 30-second window, so after
+# each baseline we pause proportionally to the burst size, keeping the
+# sustained rate low even when many new artists are baselined back to back.
+BASELINE_COOLDOWN_PER_PAGE = 2.0  # seconds per catalog page just fetched
+BASELINE_COOLDOWN_MAX = 30.0  # seconds; one full rate-limit window
+
+
+def baseline_cooldown(release_count: int) -> float:
+    pages = max(1, math.ceil(release_count / 10))
+    return min(BASELINE_COOLDOWN_MAX, pages * BASELINE_COOLDOWN_PER_PAGE)
 
 
 def released_recently(release_date: str | None, max_age_days: int = NOTIFY_MAX_AGE_DAYS) -> bool:
@@ -144,6 +158,12 @@ def check_artists(spotify: SpotifyClient, telegram: TelegramNotifier, state: Sta
                 logger.info(
                     "Baseline recorded for %s (%d releases, full catalog)", display_name, len(current_ids)
                 )
+                # The catalog fetch was a burst of requests; cool down before
+                # the next artist so consecutive baselines stay under the
+                # rolling rate-limit window.
+                cooldown = baseline_cooldown(len(releases))
+                progress.set_postfix_str(f"{display_name} — cooling down {cooldown:.0f}s")
+                time.sleep(cooldown)
                 continue
 
             known_ids = state.known_release_ids(artist_id)
