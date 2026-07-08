@@ -56,12 +56,21 @@ python -m spotify_tracker.main --interval 3600
   follows (`GET /me/following`), so there's no name list to maintain —
   following/unfollowing an artist in Spotify is how you manage what's
   tracked.
-- Each artist's albums/singles are fetched and compared against
-  `state.json`, which remembers release IDs already seen.
-- The first time an artist is checked, its current catalog is recorded as a
-  baseline (no notification), so you don't get flooded with their entire
-  back catalog. Only releases that show up afterward trigger a Telegram
-  message.
+- The first time an artist is checked, their **complete** albums/singles
+  catalog is fetched and recorded as a baseline (no notification), so you
+  don't get flooded with their back catalog and old releases can't later be
+  mistaken for new ones. If a rate limit interrupts the fetch, nothing is
+  recorded and the next run retries that artist. After each baseline the
+  tool cools down for a few seconds (proportional to the catalog size) so
+  back-to-back baselines don't trip Spotify's rate limit.
+- On every later check only the newest page of releases is fetched and
+  compared against `state.json`, which remembers release IDs already seen.
+- Only unseen releases dated within the last 30 days trigger a Telegram
+  message. Older unseen IDs (Spotify catalog noise: reissues, regional
+  editions, relinked duplicates) are absorbed into the state silently.
+- Releases are filtered to the Greek market (`GR`) by default, matching
+  what's actually playable on a Greek account. Set `SPOTIFY_MARKET` in
+  `.env` to another ISO country code to change it.
 
 ### Running on a schedule
 
