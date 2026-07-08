@@ -68,9 +68,9 @@ python -m spotify_tracker.main --interval 3600
 - Only unseen releases dated within the last 30 days trigger a Telegram
   message. Older unseen IDs (Spotify catalog noise: reissues, regional
   editions, relinked duplicates) are absorbed into the state silently.
-- No market filter is applied by default, so releases from every country
-  are seen. Set `SPOTIFY_MARKET` in `.env` (e.g. `SPOTIFY_MARKET=GR`) to
-  restrict to one market.
+- Releases are filtered to the Greek market (`GR`) by default, matching
+  what's actually playable on a Greek account. Set `SPOTIFY_MARKET` in
+  `.env` to another ISO country code to change it.
 
 ### Running on a schedule
 

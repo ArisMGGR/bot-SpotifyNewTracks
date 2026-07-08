@@ -142,9 +142,9 @@ class SpotifyClient:
         return artists
 
     def _release_params(self) -> dict:
-        # No market filter by default: filtering to one market hides releases
-        # not licensed there (e.g. local-only singles). SPOTIFY_MARKET can
-        # narrow it explicitly if the unfiltered list is too noisy.
+        # A market filter hides releases not licensed in that market, so it
+        # must match where the user actually listens (SPOTIFY_MARKET,
+        # default GR) — not a hardcoded faraway market like the old "US".
         params = {"include_groups": "album,single", "limit": 10}
         if self._market:
             params["market"] = self._market
