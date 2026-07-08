@@ -68,6 +68,10 @@ python -m spotify_tracker.main --interval 3600
 - Only unseen releases dated within the last 30 days trigger a Telegram
   message. Older unseen IDs (Spotify catalog noise: reissues, regional
   editions, relinked duplicates) are absorbed into the state silently.
+- When Spotify imposes a rate-limit penalty, the deadline is saved to
+  `state.json` and every run before it (plus a 2-minute safety margin)
+  exits without touching the API at all — requests made during an active
+  penalty extend it, so waiting it out fully is the only way to recover.
 - Releases are filtered to the Greek market (`GR`) by default, matching
   what's actually playable on a Greek account. Set `SPOTIFY_MARKET` in
   `.env` to another ISO country code to change it.
