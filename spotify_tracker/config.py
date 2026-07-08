@@ -17,6 +17,9 @@ class Config:
     spotify_refresh_token: str
     telegram_bot_token: str
     telegram_chat_id: str
+    # Optional ISO country code (e.g. "GR"). Unset means no market filter, so
+    # releases from every market are seen.
+    spotify_market: str | None = None
 
 
 def _require(name: str, missing: list[str]) -> str:
@@ -64,4 +67,5 @@ def load_config() -> Config:
         spotify_refresh_token=refresh_token,
         telegram_bot_token=telegram_bot_token,
         telegram_chat_id=telegram_chat_id,
+        spotify_market=os.getenv("SPOTIFY_MARKET") or None,
     )

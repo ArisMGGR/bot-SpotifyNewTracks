@@ -39,10 +39,11 @@ class SpotifyRateLimitError(Exception):
 
 
 class SpotifyClient:
-    def __init__(self, client_id: str, client_secret: str, refresh_token: str):
+    def __init__(self, client_id: str, client_secret: str, refresh_token: str, market: str | None = None):
         self._client_id = client_id
         self._client_secret = client_secret
         self._refresh_token = refresh_token
+        self._market = market
         self._app_token = None
         self._app_token_expiry = 0.0
         self._user_token = None
@@ -140,6 +141,15 @@ class SpotifyClient:
 
         return artists
 
+    def _release_params(self) -> dict:
+        # No market filter by default: filtering to one market hides releases
+        # not licensed there (e.g. local-only singles). SPOTIFY_MARKET can
+        # narrow it explicitly if the unfiltered list is too noisy.
+        params = {"include_groups": "album,single", "limit": 10}
+        if self._market:
+            params["market"] = self._market
+        return params
+
     def get_latest_releases(self, artist_id: str) -> list[dict]:
         """Return the artist's most recent albums/singles (one page).
 
@@ -148,10 +158,25 @@ class SpotifyClient:
         Spotify's Development Mode rate limit across a large followed list.
         (The Feb 2026 Dev Mode changes also cap the page size at 10.)
         """
-        data = self._get(
-            f"/artists/{artist_id}/albums",
-            params={"include_groups": "album,single", "limit": 10, "market": "US"},
-        )
+        data = self._get(f"/artists/{artist_id}/albums", params=self._release_params())
         releases = data.get("items", [])
         releases.sort(key=lambda r: r.get("release_date", ""), reverse=True)
+        return releases
+
+    def get_all_releases(self, artist_id: str) -> list[dict]:
+        """Return the artist's complete albums/singles catalog (every page).
+
+        Used once per artist to record a full baseline, so that old releases
+        can never later be mistaken for new ones. May raise
+        SpotifyRateLimitError mid-pagination; the caller must then discard the
+        partial result rather than record it as a baseline.
+        """
+        releases: list[dict] = []
+        url = f"{API_BASE}/artists/{artist_id}/albums"
+        params = self._release_params()
+        while url:
+            data = self._get(url, params=params)
+            releases.extend(data.get("items", []))
+            url = data.get("next")
+            params = None
         return releases
