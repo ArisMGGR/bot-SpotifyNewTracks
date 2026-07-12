@@ -48,6 +48,11 @@ NOTIFY_MAX_AGE_DAYS = 30
 BASELINE_COOLDOWN_PER_PAGE = 2.0  # seconds per catalog page just fetched
 BASELINE_COOLDOWN_MAX = 30.0  # seconds; one full rate-limit window
 
+# Extra buffer past Spotify's Retry-After before touching the API again.
+# Any request during an active penalty extends the penalty, so resuming
+# even slightly early restarts the whole block.
+RATE_LIMIT_SAFETY_MARGIN = 120  # seconds
+
 
 def baseline_cooldown(release_count: int) -> float:
     pages = max(1, math.ceil(release_count / 10))
@@ -75,22 +80,18 @@ def released_recently(release_date: str | None, max_age_days: int = NOTIFY_MAX_A
 
 
 def get_artists_to_check(spotify: SpotifyClient, state: StateStore) -> list[dict]:
-    """Followed artists, most-overdue first, from cache when fresh enough."""
+    """Followed artists, most-overdue first, from cache when fresh enough.
+
+    Raises SpotifyRateLimitError if the refresh gets rate limited: a penalty
+    is active, and continuing to check artists (even from a cached list)
+    would keep poking the API and extend it.
+    """
     artists = state.cached_followed_artists(FOLLOWED_CACHE_MAX_AGE)
     if artists is None:
-        try:
-            artists = spotify.get_followed_artists()
-            state.set_followed_artists(artists)
-            state.save()
-            logger.info("Refreshed followed-artists list (%d artists)", len(artists))
-        except SpotifyRateLimitError as err:
-            artists = state.any_cached_followed_artists()
-            if artists is None:
-                raise
-            logger.warning(
-                "Rate limited refreshing the followed list (retry after %ds); using cached list",
-                err.retry_after,
-            )
+        artists = spotify.get_followed_artists()
+        state.set_followed_artists(artists)
+        state.save()
+        logger.info("Refreshed followed-artists list (%d artists)", len(artists))
 
     # Least recently checked first, so short rate-limited runs rotate through
     # everyone over time instead of rechecking the same few. Never-checked
@@ -98,14 +99,35 @@ def get_artists_to_check(spotify: SpotifyClient, state: StateStore) -> list[dict
     return sorted(artists, key=lambda a: state.checked_at(a["id"]))
 
 
+def record_penalty(state: StateStore, retry_after: int) -> None:
+    """Persist the penalty deadline so later runs (cron or --interval) skip
+    the API entirely until it has passed."""
+    until = time.time() + retry_after + RATE_LIMIT_SAFETY_MARGIN
+    state.set_rate_limited_until(until)
+    state.save()
+    logger.warning(
+        "Penalty recorded: no Spotify requests until %s",
+        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(until)),
+    )
+
+
 def check_artists(spotify: SpotifyClient, telegram: TelegramNotifier, state: StateStore) -> None:
+    penalty_left = state.rate_limited_until() - time.time()
+    if penalty_left > 0:
+        logger.warning(
+            "Rate-limit penalty from a previous run still active for %.0f more minutes; skipping this run",
+            penalty_left / 60,
+        )
+        return
+
     try:
         artists = get_artists_to_check(spotify, state)
     except SpotifyRateLimitError as err:
         logger.warning(
-            "Spotify rate limit hit and no cached artist list yet (retry after %ds); skipping this run",
+            "Spotify rate limit hit while refreshing the followed list (retry after %ds); skipping this run",
             err.retry_after,
         )
+        record_penalty(state, err.retry_after)
         return
     if not artists:
         logger.warning("Spotify returned no followed artists for this account.")
@@ -140,6 +162,7 @@ def check_artists(spotify: SpotifyClient, telegram: TelegramNotifier, state: Sta
                     len(artists),
                     len(artists) - checked,
                 )
+                record_penalty(state, err.retry_after)
                 return
             except Exception:
                 # One artist failing shouldn't kill the whole run; the next run

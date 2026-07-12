@@ -13,7 +13,8 @@ File layout (state.json):
   "followed": {
     "fetched_at": 1751400000,
     "artists": [{"id": "...", "name": "..."}, ...]
-  }
+  },
+  "rate_limited_until": 0     # epoch seconds; runs are skipped before this
 }
 
 Older versions of this file were just {"<artist_id>": ["<album_id>", ...]};
@@ -29,7 +30,7 @@ from pathlib import Path
 class StateStore:
     def __init__(self, path: Path):
         self._path = path
-        self._data: dict = {"artists": {}, "followed": None}
+        self._data: dict = {"artists": {}, "followed": None, "rate_limited_until": 0}
         if self._path.exists():
             raw = json.loads(self._path.read_text(encoding="utf-8"))
             self._data = self._migrate(raw)
@@ -38,6 +39,7 @@ class StateStore:
     def _migrate(raw: dict) -> dict:
         if "artists" in raw and isinstance(raw.get("artists"), dict):
             raw.setdefault("followed", None)
+            raw.setdefault("rate_limited_until", 0)
             return raw
         # Old flat format: {artist_id: [release ids]}
         return {
@@ -46,7 +48,17 @@ class StateStore:
                 for artist_id, ids in raw.items()
             },
             "followed": None,
+            "rate_limited_until": 0,
         }
+
+    # --- rate-limit penalty persistence ---
+
+    def rate_limited_until(self) -> float:
+        """Epoch seconds until which Spotify's penalty is assumed active."""
+        return self._data.get("rate_limited_until") or 0
+
+    def set_rate_limited_until(self, timestamp: float) -> None:
+        self._data["rate_limited_until"] = int(timestamp)
 
     # --- per-artist release tracking ---
 
@@ -77,11 +89,6 @@ class StateStore:
         if time.time() - cache.get("fetched_at", 0) > max_age_seconds:
             return None
         return cache["artists"]
-
-    def any_cached_followed_artists(self) -> list[dict] | None:
-        """The cached list regardless of age (fallback when a fetch fails)."""
-        cache = self._data.get("followed")
-        return cache["artists"] if cache else None
 
     def set_followed_artists(self, artists: list[dict]) -> None:
         self._data["followed"] = {
