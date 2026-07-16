@@ -18,19 +18,23 @@ logger = logging.getLogger("spotify_tracker")
 TOKEN_URL = "https://accounts.spotify.com/api/token"
 API_BASE = "https://api.spotify.com/v1"
 
-# Spacing between API requests plus 429 back-off handling. Development Mode
-# apps have a low rate limit, and checking many followed artists means one
-# albums request per artist.
-MIN_REQUEST_INTERVAL = 1.0  # seconds
-MAX_RATE_LIMIT_RETRIES = 2
-MAX_RATE_LIMIT_WAIT = 60  # seconds
+# Global pacing for every API request. Spotify's limit is a rolling 30-second
+# window, so even spacing of WINDOW / MAX_PER_WINDOW guarantees the window
+# count stays under the cap regardless of how requests cluster (catalog
+# pagination, back-to-back baselines, the followed-list refresh). A sustained
+# ~10 requests per 30s got this app blocked; 5 per 30s leaves headroom.
+RATE_LIMIT_WINDOW = 30.0  # seconds
+MAX_REQUESTS_PER_WINDOW = 5
+MIN_REQUEST_INTERVAL = RATE_LIMIT_WINDOW / MAX_REQUESTS_PER_WINDOW
 
 
 class SpotifyRateLimitError(Exception):
-    """Raised when Spotify's rate-limit penalty is too long to wait out.
+    """Raised on any 429 from Spotify.
 
-    Retrying while the penalty window is active only extends it, so the
-    caller should abort the whole run and try again later.
+    A 429 means a penalty is already active, and any request during the
+    penalty window (including an in-process retry) extends it — so the
+    caller must abort the whole run and try again much later. retry_after
+    is Spotify's Retry-After header, or 0 if it wasn't sent.
     """
 
     def __init__(self, retry_after: int):
@@ -88,43 +92,36 @@ class SpotifyClient:
         else:
             url = f"{API_BASE}{url_or_path}"
 
-        for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
-            # Keep a minimum gap between requests so a big followed-artists
-            # list doesn't burst straight into Spotify's rate limit.
-            elapsed = time.time() - self._last_request_at
-            if elapsed < MIN_REQUEST_INTERVAL:
-                time.sleep(MIN_REQUEST_INTERVAL - elapsed)
+        # Evenly space every request so the rolling-window count can never
+        # exceed MAX_REQUESTS_PER_WINDOW, no matter how calls cluster.
+        elapsed = time.time() - self._last_request_at
+        if elapsed < MIN_REQUEST_INTERVAL:
+            time.sleep(MIN_REQUEST_INTERVAL - elapsed)
 
-            token = self._get_user_token() if auth == "user" else self._get_app_token()
-            headers = {"Authorization": f"Bearer {token}"}
-            response = requests.get(url, headers=headers, params=params, timeout=15)
-            self._last_request_at = time.time()
+        token = self._get_user_token() if auth == "user" else self._get_app_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        response = requests.get(url, headers=headers, params=params, timeout=15)
+        self._last_request_at = time.time()
 
-            if response.status_code == 429:
-                # Spotify says how long to back off in the Retry-After header.
-                try:
-                    wait = int(response.headers.get("Retry-After", "5"))
-                except ValueError:
-                    wait = 5
-                if wait > MAX_RATE_LIMIT_WAIT or attempt >= MAX_RATE_LIMIT_RETRIES:
-                    # The penalty is too long to wait out (it can run to many
-                    # minutes), and retrying during it only extends it.
-                    raise SpotifyRateLimitError(wait)
-                logger.warning("Rate limited by Spotify; waiting %ds before retrying", wait + 1)
-                time.sleep(wait + 1)
-                continue
+        if response.status_code == 429:
+            # Never retry in-process: any request during the penalty window
+            # extends it, and Retry-After can under-report (or be missing
+            # entirely) while the block is still active.
+            try:
+                retry_after = int(response.headers.get("Retry-After", "0"))
+            except ValueError:
+                retry_after = 0
+            raise SpotifyRateLimitError(retry_after)
 
-            if not response.ok:
-                # Surface Spotify's actual error body instead of a bare "400 Bad
-                # Request", since that's usually the only clue as to what it
-                # didn't like.
-                raise requests.exceptions.HTTPError(
-                    f"{response.status_code} error for url {response.url}: {response.text}",
-                    response=response,
-                )
-            return response.json()
-
-        raise AssertionError("unreachable")  # loop always returns or raises
+        if not response.ok:
+            # Surface Spotify's actual error body instead of a bare "400 Bad
+            # Request", since that's usually the only clue as to what it
+            # didn't like.
+            raise requests.exceptions.HTTPError(
+                f"{response.status_code} error for url {response.url}: {response.text}",
+                response=response,
+            )
+        return response.json()
 
     def get_followed_artists(self) -> list[dict]:
         """Return every artist the logged-in user follows."""
