@@ -130,7 +130,7 @@ def check_artists(spotify: SpotifyClient, telegram: TelegramNotifier, state: Sta
         record_penalty(state, err.retry_after)
         return
     if not artists:
-        logger.warning("Spotify returned no followed artists for this account.")
+        logger.warning("No followed artists to check (the followed-artists list is empty).")
         return
 
     logger.info("Checking %d followed artists (most overdue first)", len(artists))
@@ -194,12 +194,20 @@ def check_artists(spotify: SpotifyClient, telegram: TelegramNotifier, state: Sta
             known_ids = state.known_release_ids(artist_id)
             new_releases = [r for r in releases if r["id"] not in known_ids]
 
+            # Build up the set to record as we go. A release becomes "known"
+            # only once we've actually dealt with it: absorbed as old noise, or
+            # successfully notified. A release whose Telegram send fails is left
+            # out, so it stays unknown and is retried on the next run instead of
+            # being silently marked seen (which would drop the alert entirely).
+            resolved_ids = set(known_ids)
             absorbed = 0
+            notify_failed = 0
             for release in new_releases:
                 if not released_recently(release.get("release_date")):
                     # Unseen but old: catalog noise, not a new release. Merge
-                    # it into the known set below without notifying.
+                    # it into the known set without notifying.
                     absorbed += 1
+                    resolved_ids.add(release["id"])
                     continue
                 release_kind = release.get("album_group") or release.get("album_type") or "release"
                 message = (
@@ -208,16 +216,30 @@ def check_artists(spotify: SpotifyClient, telegram: TelegramNotifier, state: Sta
                     f"Released: {release.get('release_date', 'unknown')}\n"
                     f"{release.get('external_urls', {}).get('spotify', '')}"
                 )
-                telegram.send_message(message)
+                try:
+                    telegram.send_message(message)
+                except Exception:
+                    # Don't mark this release known: leaving it out means the
+                    # next run retries the alert rather than dropping it.
+                    notify_failed += 1
+                    logger.exception(
+                        "Failed to send Telegram alert for %s - %s; will retry next run",
+                        display_name,
+                        release["name"],
+                    )
+                    continue
+                resolved_ids.add(release["id"])
                 logger.info("Notified about new release: %s - %s", display_name, release["name"])
             if absorbed:
                 logger.info(
                     "Absorbed %d unseen but old release(s) for %s without notifying", absorbed, display_name
                 )
 
-            # Merge rather than replace: we only fetch the newest page now, so
-            # older IDs must stay known to avoid re-notifying about them later.
-            state.record_check(artist_id, display_name, known_ids | current_ids)
+            # resolved_ids already holds everything that should stay known:
+            # the previously-known IDs, plus this run's absorbed-and-notified
+            # releases, minus any whose notification failed. Merge rather than
+            # replace so older IDs we didn't re-fetch this run stay known too.
+            state.record_check(artist_id, display_name, resolved_ids)
             state.save()
             checked += 1
 
@@ -259,8 +281,10 @@ def main() -> None:
     state = StateStore(Path(args.state_file))
 
     def run_once() -> None:
+        # check_artists persists state itself on every path that mutates it
+        # (per artist, on penalty, and after refreshing the followed list), so
+        # no extra save is needed here.
         check_artists(spotify, telegram, state)
-        state.save()
 
     if args.interval > 0:
         logger.info("Starting polling loop every %d seconds (Ctrl+C to stop)", args.interval)
