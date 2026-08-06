@@ -3,7 +3,6 @@
 import argparse
 import calendar
 import logging
-import math
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -41,22 +40,23 @@ FOLLOWED_CACHE_MAX_AGE = 24 * 3600  # refresh the followed-artists list daily
 NOTIFY_MAX_AGE_DAYS = 30
 
 
-# Baselining an artist fetches their whole catalog in one burst (one request
-# per 10 releases). Spotify's limit is a rolling 30-second window, so after
-# each baseline we pause proportionally to the burst size, keeping the
-# sustained rate low even when many new artists are baselined back to back.
-BASELINE_COOLDOWN_PER_PAGE = 2.0  # seconds per catalog page just fetched
-BASELINE_COOLDOWN_MAX = 30.0  # seconds; one full rate-limit window
+# Baselining an artist fetches their whole catalog (one request per 10
+# releases), so a fresh state file over a large followed list means hundreds
+# of requests in a single run even with per-request spacing. Cap how many
+# artists get baselined per run; the rest are picked up on later runs
+# (never-checked artists always sort first).
+MAX_BASELINES_PER_RUN = 10
 
 # Extra buffer past Spotify's Retry-After before touching the API again.
 # Any request during an active penalty extends the penalty, so resuming
 # even slightly early restarts the whole block.
 RATE_LIMIT_SAFETY_MARGIN = 120  # seconds
 
-
-def baseline_cooldown(release_count: int) -> float:
-    pages = max(1, math.ceil(release_count / 10))
-    return min(BASELINE_COOLDOWN_MAX, pages * BASELINE_COOLDOWN_PER_PAGE)
+# Never record a penalty shorter than this. Spotify's Retry-After can be
+# small or missing while the block actually lasts much longer, and one
+# request sent mid-penalty restarts the whole block — so when in doubt,
+# stay away longer.
+RATE_LIMIT_MIN_PENALTY = 30 * 60  # seconds
 
 
 def released_recently(release_date: str | None, max_age_days: int = NOTIFY_MAX_AGE_DAYS) -> bool:
@@ -102,7 +102,7 @@ def get_artists_to_check(spotify: SpotifyClient, state: StateStore) -> list[dict
 def record_penalty(state: StateStore, retry_after: int) -> None:
     """Persist the penalty deadline so later runs (cron or --interval) skip
     the API entirely until it has passed."""
-    until = time.time() + retry_after + RATE_LIMIT_SAFETY_MARGIN
+    until = time.time() + max(retry_after, RATE_LIMIT_MIN_PENALTY) + RATE_LIMIT_SAFETY_MARGIN
     state.set_rate_limited_until(until)
     state.save()
     logger.warning(
@@ -135,12 +135,19 @@ def check_artists(spotify: SpotifyClient, telegram: TelegramNotifier, state: Sta
 
     logger.info("Checking %d followed artists (most overdue first)", len(artists))
     checked = 0
+    baselined = 0
+    deferred_baselines = 0
     with tqdm(artists, desc="Checking artists", unit="artist") as progress:
         for artist in progress:
             artist_id = artist["id"]
             display_name = artist["name"]
             progress.set_postfix_str(display_name)
             is_baseline = not state.has_artist(artist_id)
+            if is_baseline and baselined >= MAX_BASELINES_PER_RUN:
+                # Full-catalog fetches are the expensive part of a run; defer
+                # the rest to later runs to keep total request volume down.
+                deferred_baselines += 1
+                continue
             try:
                 if is_baseline:
                     # First time we see this artist: fetch the complete
@@ -178,15 +185,10 @@ def check_artists(spotify: SpotifyClient, telegram: TelegramNotifier, state: Sta
                 state.record_check(artist_id, display_name, current_ids)
                 state.save()
                 checked += 1
+                baselined += 1
                 logger.info(
                     "Baseline recorded for %s (%d releases, full catalog)", display_name, len(current_ids)
                 )
-                # The catalog fetch was a burst of requests; cool down before
-                # the next artist so consecutive baselines stay under the
-                # rolling rate-limit window.
-                cooldown = baseline_cooldown(len(releases))
-                progress.set_postfix_str(f"{display_name} — cooling down {cooldown:.0f}s")
-                time.sleep(cooldown)
                 continue
 
             known_ids = state.known_release_ids(artist_id)
@@ -219,7 +221,14 @@ def check_artists(spotify: SpotifyClient, telegram: TelegramNotifier, state: Sta
             state.save()
             checked += 1
 
-    logger.info("Run complete: checked all %d artists", checked)
+    if deferred_baselines:
+        logger.info(
+            "Run complete: checked %d artists; deferred %d first-time baselines to later runs",
+            checked,
+            deferred_baselines,
+        )
+    else:
+        logger.info("Run complete: checked all %d artists", checked)
 
 
 def main() -> None:
