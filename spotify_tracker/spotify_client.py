@@ -53,11 +53,16 @@ class SpotifyClient:
         self._user_token = None
         self._user_token_expiry = 0.0
         self._last_request_at = 0.0
+        # Count of HTTP requests actually sent to Spotify (token refreshes and
+        # API calls). Reported per run so you can see how close a run came to
+        # the rate limit, even when one stops it early.
+        self.request_count = 0
 
     def _get_app_token(self) -> str:
         if self._app_token and time.time() < self._app_token_expiry:
             return self._app_token
 
+        self.request_count += 1
         response = requests.post(
             TOKEN_URL,
             data={"grant_type": "client_credentials"},
@@ -74,6 +79,7 @@ class SpotifyClient:
         if self._user_token and time.time() < self._user_token_expiry:
             return self._user_token
 
+        self.request_count += 1
         response = requests.post(
             TOKEN_URL,
             data={"grant_type": "refresh_token", "refresh_token": self._refresh_token},
@@ -100,6 +106,7 @@ class SpotifyClient:
 
         token = self._get_user_token() if auth == "user" else self._get_app_token()
         headers = {"Authorization": f"Bearer {token}"}
+        self.request_count += 1
         response = requests.get(url, headers=headers, params=params, timeout=15)
         self._last_request_at = time.time()
 
@@ -147,26 +154,12 @@ class SpotifyClient:
             params["market"] = self._market
         return params
 
-    def get_latest_releases(self, artist_id: str) -> list[dict]:
-        """Return the artist's most recent albums/singles (one page).
-
-        Detecting a new release only requires the newest items, and fetching
-        the full catalog cost several requests per artist — enough to trip
-        Spotify's Development Mode rate limit across a large followed list.
-        (The Feb 2026 Dev Mode changes also cap the page size at 10.)
-        """
-        data = self._get(f"/artists/{artist_id}/albums", params=self._release_params())
-        releases = data.get("items", [])
-        releases.sort(key=lambda r: r.get("release_date", ""), reverse=True)
-        return releases
-
     def get_all_releases(self, artist_id: str) -> list[dict]:
         """Return the artist's complete albums/singles catalog (every page).
 
-        Used once per artist to record a full baseline, so that old releases
-        can never later be mistaken for new ones. May raise
-        SpotifyRateLimitError mid-pagination; the caller must then discard the
-        partial result rather than record it as a baseline.
+        Fetched on every check so no release can be missed because of Spotify's
+        page ordering. May raise SpotifyRateLimitError mid-pagination; the
+        caller must then discard the partial result rather than record it.
         """
         releases: list[dict] = []
         url = f"{API_BASE}/artists/{artist_id}/albums"

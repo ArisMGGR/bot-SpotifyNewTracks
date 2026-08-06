@@ -75,8 +75,16 @@ python -m spotify_tracker.main --log-dir /var/log/spotify-tracker
 - Every API request is spaced at least 6 seconds from the previous one
   (at most 5 requests in any rolling 30-second window, the window Spotify
   rate-limits on), regardless of how requests cluster.
-- On every later check only the newest page of releases is fetched and
-  compared against `state.json`, which remembers release IDs already seen.
+- On every later check the artist's **complete** albums/singles catalog is
+  fetched again and compared against `state.json`, which remembers release
+  IDs already seen. Fetching everything (rather than just the newest page)
+  means a release can't be missed because of how Spotify happens to order a
+  page, at the cost of more API requests per run.
+- Each run reports how many Spotify API requests it made (`Spotify API
+  requests this run: N`), printed at the end of the run — and also when a
+  rate limit stops the run early or it crashes — so you can see how close a
+  run came to the limit. The count includes token refreshes and appears in
+  both the console and that run's `logs/` file.
 - Only unseen releases dated within the last 30 days trigger a Telegram
   message. Older unseen IDs (Spotify catalog noise: reissues, regional
   editions, relinked duplicates) are absorbed into the state silently.

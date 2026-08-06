@@ -178,19 +178,18 @@ def check_artists(spotify: SpotifyClient, telegram: TelegramNotifier, state: Sta
             progress.set_postfix_str(display_name)
             is_baseline = not state.has_artist(artist_id)
             if is_baseline and baselined >= MAX_BASELINES_PER_RUN:
-                # Full-catalog fetches are the expensive part of a run; defer
-                # the rest to later runs to keep total request volume down.
+                # A first-time artist records their whole back catalog silently;
+                # cap how many we onboard per run so a fresh state file over a
+                # large followed list doesn't fire off one huge burst of
+                # catalog requests. The rest are picked up on later runs.
                 deferred_baselines += 1
                 continue
             try:
-                if is_baseline:
-                    # First time we see this artist: fetch the complete
-                    # catalog so the baseline is exhaustive. If this raises
-                    # mid-pagination, nothing is recorded (atomic) and the
-                    # next run retries this artist from scratch.
-                    releases = spotify.get_all_releases(artist_id)
-                else:
-                    releases = spotify.get_latest_releases(artist_id)
+                # Always fetch the artist's complete albums/singles catalog,
+                # so no release can be missed because of Spotify's page
+                # ordering. If this raises mid-pagination, nothing is recorded
+                # (atomic) and the next run retries this artist from scratch.
+                releases = spotify.get_all_releases(artist_id)
             except SpotifyRateLimitError as err:
                 # Any further request during the penalty window extends it, so
                 # stop here; already-checked artists are saved and the next run
@@ -272,7 +271,8 @@ def check_artists(spotify: SpotifyClient, telegram: TelegramNotifier, state: Sta
             # resolved_ids already holds everything that should stay known:
             # the previously-known IDs, plus this run's absorbed-and-notified
             # releases, minus any whose notification failed. Merge rather than
-            # replace so older IDs we didn't re-fetch this run stay known too.
+            # replace so a release that temporarily drops out of the
+            # market-filtered catalog stays known and isn't re-notified later.
             state.record_check(artist_id, display_name, resolved_ids)
             state.save()
             checked += 1
@@ -326,6 +326,7 @@ def main() -> None:
         # (per artist, on penalty, and after refreshing the followed list), so
         # no extra save is needed here.
         log_handler = _begin_run_log(log_dir)
+        calls_before = spotify.request_count
         try:
             check_artists(spotify, telegram, state)
         except Exception:
@@ -335,6 +336,10 @@ def main() -> None:
             # error into this run's file first.
             logger.exception("Error while checking artists")
         finally:
+            # Always report the request count — including when a rate limit
+            # stopped the run early or it crashed outright. This runs before
+            # the exception (if any) propagates, so the number is never lost.
+            logger.info("Spotify API requests this run: %d", spotify.request_count - calls_before)
             _end_run_log(log_handler)
 
     if args.interval > 0:
