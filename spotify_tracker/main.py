@@ -26,10 +26,44 @@ class TqdmLoggingHandler(logging.Handler):
             self.handleError(record)
 
 
+_LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
+
 _handler = TqdmLoggingHandler()
-_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+_handler.setFormatter(logging.Formatter(_LOG_FORMAT))
 logging.basicConfig(level=logging.INFO, handlers=[_handler])
 logger = logging.getLogger("spotify_tracker")
+
+
+# Each run also writes a timestamped copy of its console output to a file in
+# this directory, one file per run.
+DEFAULT_LOG_DIR = "logs"
+
+
+def _begin_run_log(log_dir: Path) -> logging.Handler:
+    """Attach a fresh per-run log file so this run's console output is also
+    saved to logs/run_<timestamp>.txt. Returns the handler to pass to
+    _end_run_log when the run finishes."""
+    log_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+    path = log_dir / f"run_{timestamp}.txt"
+    # Guard against two runs starting in the same second (e.g. a short
+    # --interval) overwriting each other's file.
+    counter = 1
+    while path.exists():
+        path = log_dir / f"run_{timestamp}_{counter}.txt"
+        counter += 1
+
+    handler = logging.FileHandler(path, encoding="utf-8")
+    handler.setFormatter(logging.Formatter(_LOG_FORMAT))
+    logger.addHandler(handler)
+    logger.info("Logging this run to %s", path)
+    return handler
+
+
+def _end_run_log(handler: logging.Handler) -> None:
+    """Detach and close a per-run log file opened by _begin_run_log."""
+    logger.removeHandler(handler)
+    handler.close()
 
 
 FOLLOWED_CACHE_MAX_AGE = 24 * 3600  # refresh the followed-artists list daily
@@ -268,7 +302,13 @@ def main() -> None:
         default=0,
         help="If set, keep running and poll every N seconds instead of checking once and exiting.",
     )
+    parser.add_argument(
+        "--log-dir",
+        default=DEFAULT_LOG_DIR,
+        help=f"Directory for per-run log files (one .txt per run; default: {DEFAULT_LOG_DIR}).",
+    )
     args = parser.parse_args()
+    log_dir = Path(args.log_dir)
 
     config = load_config()
     spotify = SpotifyClient(
@@ -280,22 +320,30 @@ def main() -> None:
     telegram = TelegramNotifier(config.telegram_bot_token, config.telegram_chat_id)
     state = StateStore(Path(args.state_file))
 
-    def run_once() -> None:
+    def run_once(catch_errors: bool) -> None:
+        # Mirror this run's console output to its own logs/run_<timestamp>.txt.
         # check_artists persists state itself on every path that mutates it
         # (per artist, on penalty, and after refreshing the followed list), so
         # no extra save is needed here.
-        check_artists(spotify, telegram, state)
+        log_handler = _begin_run_log(log_dir)
+        try:
+            check_artists(spotify, telegram, state)
+        except Exception:
+            if not catch_errors:
+                raise
+            # In the polling loop, keep going after a failed run — but log the
+            # error into this run's file first.
+            logger.exception("Error while checking artists")
+        finally:
+            _end_run_log(log_handler)
 
     if args.interval > 0:
         logger.info("Starting polling loop every %d seconds (Ctrl+C to stop)", args.interval)
         while True:
-            try:
-                run_once()
-            except Exception:
-                logger.exception("Error while checking artists")
+            run_once(catch_errors=True)
             time.sleep(args.interval)
     else:
-        run_once()
+        run_once(catch_errors=False)
 
 
 if __name__ == "__main__":

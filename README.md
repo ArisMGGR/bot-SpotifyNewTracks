@@ -50,6 +50,14 @@ Or keep it running and poll every N seconds (e.g. every hour):
 python -m spotify_tracker.main --interval 3600
 ```
 
+Every run also saves a copy of its console output to its own timestamped
+file under `logs/` (e.g. `logs/run_2026-08-06_15-30-00.txt`) — one file per
+run, so with cron or `--interval` you get a separate log for each check.
+Change the location with `--log-dir`:
+```bash
+python -m spotify_tracker.main --log-dir /var/log/spotify-tracker
+```
+
 ### How it works
 
 - On each run, the program fetches every artist your Spotify account
