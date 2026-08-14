@@ -10,7 +10,11 @@ from pathlib import Path
 from tqdm import tqdm
 
 from spotify_tracker.config import load_config
-from spotify_tracker.spotify_client import SpotifyClient, SpotifyRateLimitError
+from spotify_tracker.spotify_client import (
+    SpotifyClient,
+    SpotifyDailyLimitError,
+    SpotifyRateLimitError,
+)
 from spotify_tracker.state import StateStore
 from spotify_tracker.telegram import TelegramNotifier
 
@@ -93,6 +97,29 @@ RATE_LIMIT_SAFETY_MARGIN = 120  # seconds
 RATE_LIMIT_MIN_PENALTY = 30 * 60  # seconds
 
 
+# Spotify's daily quota for this app is ~105 requests; stop at 100 to keep a
+# margin before Spotify itself starts blocking. The count spans every run of
+# the calendar day (persisted in state) and resets at UTC midnight.
+DAILY_CALL_LIMIT = 100
+
+# What to assume a never-checked artist's full-catalog fetch will cost, when
+# there's no recorded cost to go on yet. Most artists paginate in a few
+# requests (10 releases per page); once checked, their real cost replaces this.
+DEFAULT_ARTIST_COST = 4
+
+# Reserve one extra call on top of an artist's estimated cost, to cover a
+# token refresh that might land mid-fetch.
+COST_SAFETY_MARGIN = 1
+
+
+def estimated_cost(state: StateStore, artist_id: str) -> int:
+    """Predicted number of Spotify calls to fully check this artist, from last
+    run's measured cost (plus a small margin) or a default for new artists."""
+    last = state.last_cost(artist_id)
+    base = last if last is not None else DEFAULT_ARTIST_COST
+    return base + COST_SAFETY_MARGIN
+
+
 def released_recently(release_date: str | None, max_age_days: int = NOTIFY_MAX_AGE_DAYS) -> bool:
     """True if the release date is within the notification window.
 
@@ -154,6 +181,14 @@ def check_artists(spotify: SpotifyClient, telegram: TelegramNotifier, state: Sta
         )
         return
 
+    if spotify.daily_calls >= DAILY_CALL_LIMIT:
+        logger.warning(
+            "Daily Spotify call budget already spent (%d/%d); skipping this run until the budget resets",
+            spotify.daily_calls,
+            DAILY_CALL_LIMIT,
+        )
+        return
+
     try:
         artists = get_artists_to_check(spotify, state)
     except SpotifyRateLimitError as err:
@@ -163,6 +198,13 @@ def check_artists(spotify: SpotifyClient, telegram: TelegramNotifier, state: Sta
         )
         record_penalty(state, err.retry_after)
         return
+    except SpotifyDailyLimitError as err:
+        logger.warning(
+            "Daily Spotify call budget reached (%d/%d) while refreshing the followed list; skipping this run",
+            err.calls_today,
+            err.limit,
+        )
+        return
     if not artists:
         logger.warning("No followed artists to check (the followed-artists list is empty).")
         return
@@ -171,6 +213,7 @@ def check_artists(spotify: SpotifyClient, telegram: TelegramNotifier, state: Sta
     checked = 0
     baselined = 0
     deferred_baselines = 0
+    budget_deferred = 0
     with tqdm(artists, desc="Checking artists", unit="artist") as progress:
         for artist in progress:
             artist_id = artist["id"]
@@ -184,6 +227,26 @@ def check_artists(spotify: SpotifyClient, telegram: TelegramNotifier, state: Sta
                 # catalog requests. The rest are picked up on later runs.
                 deferred_baselines += 1
                 continue
+
+            # Don't even start an artist we predict won't fit in the day's
+            # remaining budget: get_all_releases is atomic, so hitting the
+            # limit mid-fetch wastes those calls with nothing recorded. Skip
+            # to the next artist (a cheaper one may still fit); this artist,
+            # left unchecked, stays most-overdue and is retried first once the
+            # budget resets.
+            estimate = estimated_cost(state, artist_id)
+            remaining = DAILY_CALL_LIMIT - spotify.daily_calls
+            if estimate > remaining:
+                budget_deferred += 1
+                logger.info(
+                    "Deferring %s: ~%d calls needed but only %d left in today's budget",
+                    display_name,
+                    estimate,
+                    remaining,
+                )
+                continue
+
+            calls_before_artist = spotify.request_count
             try:
                 # Always fetch the artist's complete albums/singles catalog,
                 # so no release can be missed because of Spotify's page
@@ -204,23 +267,43 @@ def check_artists(spotify: SpotifyClient, telegram: TelegramNotifier, state: Sta
                 )
                 record_penalty(state, err.retry_after)
                 return
+            except SpotifyDailyLimitError as err:
+                # The estimate fell short (a grown catalog or a mid-fetch token
+                # refresh pushed us over). The partial fetch is discarded; stop
+                # cleanly and let the remaining artists wait for the reset.
+                progress.close()
+                logger.warning(
+                    "Daily Spotify call budget reached (%d/%d); stopping: %d/%d artists checked",
+                    err.calls_today,
+                    err.limit,
+                    checked,
+                    len(artists),
+                )
+                return
             except Exception:
                 # One artist failing shouldn't kill the whole run; the next run
                 # will pick this artist up again.
                 logger.exception("Failed to fetch releases for %s; skipping", display_name)
                 continue
 
+            # How many calls this full check actually cost, saved with the
+            # artist so the next run can budget for them.
+            cost = spotify.request_count - calls_before_artist
             current_ids = {release["id"] for release in releases}
 
             if is_baseline:
                 # Record the full catalog as a baseline instead of notifying
                 # about it.
-                state.record_check(artist_id, display_name, current_ids)
+                state.record_check(artist_id, display_name, current_ids, cost=cost)
+                state.set_api_calls_today(spotify.daily_calls)
                 state.save()
                 checked += 1
                 baselined += 1
                 logger.info(
-                    "Baseline recorded for %s (%d releases, full catalog)", display_name, len(current_ids)
+                    "Baseline recorded for %s (%d releases, full catalog, %d API calls)",
+                    display_name,
+                    len(current_ids),
+                    cost,
                 )
                 continue
 
@@ -273,15 +356,21 @@ def check_artists(spotify: SpotifyClient, telegram: TelegramNotifier, state: Sta
             # releases, minus any whose notification failed. Merge rather than
             # replace so a release that temporarily drops out of the
             # market-filtered catalog stays known and isn't re-notified later.
-            state.record_check(artist_id, display_name, resolved_ids)
+            state.record_check(artist_id, display_name, resolved_ids, cost=cost)
+            state.set_api_calls_today(spotify.daily_calls)
             state.save()
             checked += 1
 
+    deferred_notes = []
     if deferred_baselines:
+        deferred_notes.append(f"{deferred_baselines} first-time baselines")
+    if budget_deferred:
+        deferred_notes.append(f"{budget_deferred} artists over today's call budget")
+    if deferred_notes:
         logger.info(
-            "Run complete: checked %d artists; deferred %d first-time baselines to later runs",
+            "Run complete: checked %d artists; deferred %s to later runs",
             checked,
-            deferred_baselines,
+            " and ".join(deferred_notes),
         )
     else:
         logger.info("Run complete: checked all %d artists", checked)
@@ -316,6 +405,7 @@ def main() -> None:
         config.spotify_client_secret,
         config.spotify_refresh_token,
         market=config.spotify_market,
+        daily_call_limit=DAILY_CALL_LIMIT,
     )
     telegram = TelegramNotifier(config.telegram_bot_token, config.telegram_chat_id)
     state = StateStore(Path(args.state_file))
@@ -323,9 +413,12 @@ def main() -> None:
     def run_once(catch_errors: bool) -> None:
         # Mirror this run's console output to its own logs/run_<timestamp>.txt.
         # check_artists persists state itself on every path that mutates it
-        # (per artist, on penalty, and after refreshing the followed list), so
-        # no extra save is needed here.
+        # (per artist, on penalty, and after refreshing the followed list);
+        # the finally below persists the day's call total as a backstop.
         log_handler = _begin_run_log(log_dir)
+        # Seed the day's running call total from state so the budget is
+        # enforced across runs; api_calls_today resets itself on a new day.
+        spotify.start_day(state.api_calls_today())
         calls_before = spotify.request_count
         try:
             check_artists(spotify, telegram, state)
@@ -336,10 +429,17 @@ def main() -> None:
             # error into this run's file first.
             logger.exception("Error while checking artists")
         finally:
+            # Persist the day's call total even if the run crashed or stopped
+            # early, so the next run inherits an accurate budget.
+            state.set_api_calls_today(spotify.daily_calls)
+            state.save()
             # Always report the request count — including when a rate limit
             # stopped the run early or it crashed outright. This runs before
             # the exception (if any) propagates, so the number is never lost.
             logger.info("Spotify API requests this run: %d", spotify.request_count - calls_before)
+            logger.info(
+                "Spotify API calls used today: %d/%d", spotify.daily_calls, DAILY_CALL_LIMIT
+            )
             _end_run_log(log_handler)
 
     if args.interval > 0:

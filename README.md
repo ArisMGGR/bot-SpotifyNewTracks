@@ -85,6 +85,22 @@ python -m spotify_tracker.main --log-dir /var/log/spotify-tracker
   rate limit stops the run early or it crashes — so you can see how close a
   run came to the limit. The count includes token refreshes and appears in
   both the console and that run's `logs/` file.
+- Spotify's daily quota for this app is about 105 requests, so the program
+  keeps a running total of the calls it makes across every run of the
+  calendar day (persisted in `state.json`, reset at UTC midnight) and stops
+  at **100** — leaving headroom before Spotify itself starts blocking. Once
+  the day's budget is spent, later runs that day exit without touching the
+  API and print `Spotify API calls used today: N/100`.
+- To spend that budget well, each artist's full check records **how many API
+  calls it cost** (saved as `last_cost` alongside that artist in
+  `state.json`). Before checking an artist, the program compares that cost
+  against the calls left in the day and, if the artist wouldn't fit, defers
+  them to a later run instead of starting a fetch that would hit the limit
+  mid-way (which would waste the calls, since a catalog fetch is recorded
+  only when it completes). Deferred artists stay "most overdue" and are
+  retried first once the budget resets. A never-checked artist has no
+  recorded cost yet, so a small default estimate is used until their first
+  real cost is measured.
 - Only unseen releases dated within the last 30 days trigger a Telegram
   message. Older unseen IDs (Spotify catalog noise: reissues, regional
   editions, relinked duplicates) are absorbed into the state silently.
