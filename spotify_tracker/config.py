@@ -17,9 +17,9 @@ class Config:
     spotify_refresh_token: str
     telegram_bot_token: str
     telegram_chat_id: str
-    # ISO country code used to filter releases. Defaults to GR; set the
-    # SPOTIFY_MARKET env var to override.
-    spotify_market: str = "GR"
+    # ISO country code used to filter releases. load_config supplies the value
+    # (SPOTIFY_MARKET env var, defaulting to GR).
+    spotify_market: str
 
 
 def _require(name: str, missing: list[str]) -> str:

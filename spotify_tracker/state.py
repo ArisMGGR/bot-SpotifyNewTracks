@@ -24,13 +24,26 @@ overdue).
 
 import json
 import time
+from datetime import datetime, timezone
 from pathlib import Path
+
+
+def _today() -> str:
+    """The current calendar day as YYYY-MM-DD in UTC. Spotify's daily quota
+    resets on a fixed clock, so use UTC rather than local time so the reset is
+    deterministic regardless of where the machine runs."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
 class StateStore:
     def __init__(self, path: Path):
         self._path = path
-        self._data: dict = {"artists": {}, "followed": None, "rate_limited_until": 0}
+        self._data: dict = {
+            "artists": {},
+            "followed": None,
+            "rate_limited_until": 0,
+            "api_usage": None,
+        }
         if self._path.exists():
             raw = json.loads(self._path.read_text(encoding="utf-8"))
             self._data = self._migrate(raw)
@@ -40,6 +53,7 @@ class StateStore:
         if "artists" in raw and isinstance(raw.get("artists"), dict):
             raw.setdefault("followed", None)
             raw.setdefault("rate_limited_until", 0)
+            raw.setdefault("api_usage", None)
             return raw
         # Old flat format: {artist_id: [release ids]}
         return {
@@ -49,7 +63,23 @@ class StateStore:
             },
             "followed": None,
             "rate_limited_until": 0,
+            "api_usage": None,
         }
+
+    # --- daily API-call budget tracking ---
+
+    def api_calls_today(self) -> int:
+        """Spotify calls already counted for the current UTC day (0 if the
+        stored tally is from an earlier day — i.e. the budget has reset)."""
+        usage = self._data.get("api_usage")
+        if not usage or usage.get("date") != _today():
+            return 0
+        return usage.get("count", 0)
+
+    def set_api_calls_today(self, count: int) -> None:
+        """Persist today's running call total, stamped with today's date so a
+        new day is recognised as a fresh budget."""
+        self._data["api_usage"] = {"date": _today(), "count": int(count)}
 
     # --- rate-limit penalty persistence ---
 
@@ -73,12 +103,25 @@ class StateStore:
         entry = self._data["artists"].get(artist_id)
         return entry.get("checked_at", 0) if entry else 0
 
-    def record_check(self, artist_id: str, name: str, release_ids: set[str]) -> None:
-        self._data["artists"][artist_id] = {
+    def last_cost(self, artist_id: str) -> int | None:
+        """How many Spotify calls the previous full check of this artist took,
+        or None if never recorded. Used to predict whether checking them again
+        fits in the day's remaining budget."""
+        entry = self._data["artists"].get(artist_id)
+        return entry.get("last_cost") if entry else None
+
+    def record_check(
+        self, artist_id: str, name: str, release_ids: set[str], cost: int | None = None
+    ) -> None:
+        entry = {
             "name": name,
             "releases": sorted(release_ids),
             "checked_at": int(time.time()),
         }
+        if cost is not None:
+            # Remember what this check cost so the next run can budget for it.
+            entry["last_cost"] = int(cost)
+        self._data["artists"][artist_id] = entry
 
     # --- followed-artists cache ---
 

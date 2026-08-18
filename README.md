@@ -50,6 +50,14 @@ Or keep it running and poll every N seconds (e.g. every hour):
 python -m spotify_tracker.main --interval 3600
 ```
 
+Every run also saves a copy of its console output to its own timestamped
+file under `logs/` (e.g. `logs/run_2026-08-06_15-30-00.txt`) — one file per
+run, so with cron or `--interval` you get a separate log for each check.
+Change the location with `--log-dir`:
+```bash
+python -m spotify_tracker.main --log-dir /var/log/spotify-tracker
+```
+
 ### How it works
 
 - On each run, the program fetches every artist your Spotify account
@@ -67,8 +75,32 @@ python -m spotify_tracker.main --interval 3600
 - Every API request is spaced at least 6 seconds from the previous one
   (at most 5 requests in any rolling 30-second window, the window Spotify
   rate-limits on), regardless of how requests cluster.
-- On every later check only the newest page of releases is fetched and
-  compared against `state.json`, which remembers release IDs already seen.
+- On every later check the artist's **complete** albums/singles catalog is
+  fetched again and compared against `state.json`, which remembers release
+  IDs already seen. Fetching everything (rather than just the newest page)
+  means a release can't be missed because of how Spotify happens to order a
+  page, at the cost of more API requests per run.
+- Each run reports how many Spotify API requests it made (`Spotify API
+  requests this run: N`), printed at the end of the run — and also when a
+  rate limit stops the run early or it crashes — so you can see how close a
+  run came to the limit. The count includes token refreshes and appears in
+  both the console and that run's `logs/` file.
+- Spotify's daily quota for this app is about 105 requests, so the program
+  keeps a running total of the calls it makes across every run of the
+  calendar day (persisted in `state.json`, reset at UTC midnight) and stops
+  at **100** — leaving headroom before Spotify itself starts blocking. Once
+  the day's budget is spent, later runs that day exit without touching the
+  API and print `Spotify API calls used today: N/100`.
+- To spend that budget well, each artist's full check records **how many API
+  calls it cost** (saved as `last_cost` alongside that artist in
+  `state.json`). Before checking an artist, the program compares that cost
+  against the calls left in the day and, if the artist wouldn't fit, defers
+  them to a later run instead of starting a fetch that would hit the limit
+  mid-way (which would waste the calls, since a catalog fetch is recorded
+  only when it completes). Deferred artists stay "most overdue" and are
+  retried first once the budget resets. A never-checked artist has no
+  recorded cost yet, so a small default estimate is used until their first
+  real cost is measured.
 - Only unseen releases dated within the last 30 days trigger a Telegram
   message. Older unseen IDs (Spotify catalog noise: reissues, regional
   editions, relinked duplicates) are absorbed into the state silently.

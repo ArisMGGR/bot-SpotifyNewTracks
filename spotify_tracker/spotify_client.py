@@ -42,8 +42,32 @@ class SpotifyRateLimitError(Exception):
         super().__init__(f"Spotify rate limit active; retry after {retry_after}s")
 
 
+class SpotifyDailyLimitError(Exception):
+    """Raised before a request that would exceed the day's self-imposed call
+    budget.
+
+    Unlike a 429, this penalty is our own: Spotify allows roughly 105 calls
+    per day, so the client refuses to make a call once the day's budget
+    (default 100) is spent, stopping short of the point where Spotify itself
+    would start blocking. The remaining artists are picked up on the next
+    day's runs, once the budget resets.
+    """
+
+    def __init__(self, calls_today: int, limit: int):
+        self.calls_today = calls_today
+        self.limit = limit
+        super().__init__(f"Daily Spotify call budget reached ({calls_today}/{limit})")
+
+
 class SpotifyClient:
-    def __init__(self, client_id: str, client_secret: str, refresh_token: str, market: str | None = None):
+    def __init__(
+        self,
+        client_id: str,
+        client_secret: str,
+        refresh_token: str,
+        market: str | None = None,
+        daily_call_limit: int | None = None,
+    ):
         self._client_id = client_id
         self._client_secret = client_secret
         self._refresh_token = refresh_token
@@ -53,11 +77,39 @@ class SpotifyClient:
         self._user_token = None
         self._user_token_expiry = 0.0
         self._last_request_at = 0.0
+        # Count of HTTP requests actually sent to Spotify (token refreshes and
+        # API calls). Reported per run so you can see how close a run came to
+        # the rate limit, even when one stops it early.
+        self.request_count = 0
+        # Running total of calls attributed to the current calendar day,
+        # spanning every run of the day (persisted between runs by the caller
+        # via start_day). Spotify's daily quota is what actually blocks the app
+        # long-term, so this — not request_count — is what the budget guards.
+        self.daily_calls = 0
+        self._daily_call_limit = daily_call_limit
+
+    def start_day(self, calls_already_made: int) -> None:
+        """Seed the day's running call total from persisted state at the start
+        of a run, so the daily budget is enforced across separate runs (cron)
+        as well as within one long-lived process (--interval)."""
+        self.daily_calls = calls_already_made
+
+    def _check_daily_budget(self) -> None:
+        if self._daily_call_limit is not None and self.daily_calls >= self._daily_call_limit:
+            raise SpotifyDailyLimitError(self.daily_calls, self._daily_call_limit)
+
+    def _account_request(self) -> None:
+        """Refuse a request that would exceed the day's budget, otherwise count
+        the one about to be sent (toward both the per-run and per-day totals)."""
+        self._check_daily_budget()
+        self.request_count += 1
+        self.daily_calls += 1
 
     def _get_app_token(self) -> str:
         if self._app_token and time.time() < self._app_token_expiry:
             return self._app_token
 
+        self._account_request()
         response = requests.post(
             TOKEN_URL,
             data={"grant_type": "client_credentials"},
@@ -74,6 +126,7 @@ class SpotifyClient:
         if self._user_token and time.time() < self._user_token_expiry:
             return self._user_token
 
+        self._account_request()
         response = requests.post(
             TOKEN_URL,
             data={"grant_type": "refresh_token", "refresh_token": self._refresh_token},
@@ -92,6 +145,10 @@ class SpotifyClient:
         else:
             url = f"{API_BASE}{url_or_path}"
 
+        # Bail before the pacing sleep if the day's budget is already spent —
+        # no point waiting 6 seconds for a call we're going to refuse.
+        self._check_daily_budget()
+
         # Evenly space every request so the rolling-window count can never
         # exceed MAX_REQUESTS_PER_WINDOW, no matter how calls cluster.
         elapsed = time.time() - self._last_request_at
@@ -100,6 +157,7 @@ class SpotifyClient:
 
         token = self._get_user_token() if auth == "user" else self._get_app_token()
         headers = {"Authorization": f"Bearer {token}"}
+        self._account_request()
         response = requests.get(url, headers=headers, params=params, timeout=15)
         self._last_request_at = time.time()
 
@@ -147,26 +205,12 @@ class SpotifyClient:
             params["market"] = self._market
         return params
 
-    def get_latest_releases(self, artist_id: str) -> list[dict]:
-        """Return the artist's most recent albums/singles (one page).
-
-        Detecting a new release only requires the newest items, and fetching
-        the full catalog cost several requests per artist — enough to trip
-        Spotify's Development Mode rate limit across a large followed list.
-        (The Feb 2026 Dev Mode changes also cap the page size at 10.)
-        """
-        data = self._get(f"/artists/{artist_id}/albums", params=self._release_params())
-        releases = data.get("items", [])
-        releases.sort(key=lambda r: r.get("release_date", ""), reverse=True)
-        return releases
-
     def get_all_releases(self, artist_id: str) -> list[dict]:
         """Return the artist's complete albums/singles catalog (every page).
 
-        Used once per artist to record a full baseline, so that old releases
-        can never later be mistaken for new ones. May raise
-        SpotifyRateLimitError mid-pagination; the caller must then discard the
-        partial result rather than record it as a baseline.
+        Fetched on every check so no release can be missed because of Spotify's
+        page ordering. May raise SpotifyRateLimitError mid-pagination; the
+        caller must then discard the partial result rather than record it.
         """
         releases: list[dict] = []
         url = f"{API_BASE}/artists/{artist_id}/albums"
