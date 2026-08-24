@@ -118,7 +118,44 @@ python -m spotify_tracker.main --log-dir /var/log/spotify-tracker
 
 ### Running on a schedule
 
-For a one-off check per run, add a cron entry, e.g. every 30 minutes:
+#### Auto-install (recommended): a check every ~25 hours
+
+From the repo root:
+```bash
+./install_cron.sh
+```
+This does the full setup in one command:
+
+1. Creates a virtualenv in `./venv` and installs `requirements.txt` into it.
+2. Installs a crontab entry that runs the check on a **~25-hour** cadence.
+
+You still need a configured `.env` and a completed one-time
+`python -m spotify_tracker.login` (the installer warns if `.env` is missing).
+
+To remove the schedule later:
+```bash
+./install_cron.sh --uninstall
+```
+Other flags: `--no-venv` (install only the cron job, skip venv/pip),
+`--help`.
+
+**Why 25 hours needs a wrapper.** Plain cron can't express "every 25 hours"
+— its fields are fixed clock times, so any attempt drifts. So the installed
+crontab entry actually polls **hourly** and calls `scripts/run_check.sh`,
+which performs a real check only once ~25 hours have elapsed since the last
+one (tracked in `state/last_cron_run`, with an `flock` so runs never
+overlap). The result is a genuine ~25h gap using nothing but standard cron.
+Override the interval with the `CRON_INTERVAL_HOURS` environment variable.
+Cron output is appended to `logs/cron.log`; each individual run still writes
+its own file under `logs/` as usual.
+
+The scheduled job uses `./venv/bin/python` if present, otherwise the system
+`python3`.
+
+#### Manual cron
+
+If you'd rather manage cron yourself, add a one-off check per run, e.g. every
+30 minutes:
 ```
 */30 * * * * cd /path/to/server_SpotifyNewTracks && /usr/bin/python3 -m spotify_tracker.main >> tracker.log 2>&1
 ```
