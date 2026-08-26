@@ -38,24 +38,17 @@ logging.basicConfig(level=logging.INFO, handlers=[_handler])
 logger = logging.getLogger("spotify_tracker")
 
 
-# Each run also writes a timestamped copy of its console output to a file in
-# this directory, one file per run.
+# Each run also writes a copy of its console output to a file in this
+# directory, one file per calendar day.
 DEFAULT_LOG_DIR = "logs"
 
 
 def _begin_run_log(log_dir: Path) -> logging.Handler:
-    """Attach a fresh per-run log file so this run's console output is also
-    saved to logs/run_<timestamp>.txt. Returns the handler to pass to
-    _end_run_log when the run finishes."""
+    """Attach the current day's log file so this run's console output is also
+    saved to logs/<YYYY-MM-DD>.log. Runs on the same day append to the same
+    file. Returns the handler to pass to _end_run_log when the run finishes."""
     log_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
-    path = log_dir / f"run_{timestamp}.txt"
-    # Guard against two runs starting in the same second (e.g. a short
-    # --interval) overwriting each other's file.
-    counter = 1
-    while path.exists():
-        path = log_dir / f"run_{timestamp}_{counter}.txt"
-        counter += 1
+    path = log_dir / f"{time.strftime('%Y-%m-%d')}.log"
 
     handler = logging.FileHandler(path, encoding="utf-8")
     handler.setFormatter(logging.Formatter(_LOG_FORMAT))
@@ -65,7 +58,7 @@ def _begin_run_log(log_dir: Path) -> logging.Handler:
 
 
 def _end_run_log(handler: logging.Handler) -> None:
-    """Detach and close a per-run log file opened by _begin_run_log."""
+    """Detach and close a day's log file opened by _begin_run_log."""
     logger.removeHandler(handler)
     handler.close()
 
@@ -394,7 +387,7 @@ def main() -> None:
     parser.add_argument(
         "--log-dir",
         default=DEFAULT_LOG_DIR,
-        help=f"Directory for per-run log files (one .txt per run; default: {DEFAULT_LOG_DIR}).",
+        help=f"Directory for log files (one .log per day; default: {DEFAULT_LOG_DIR}).",
     )
     args = parser.parse_args()
     log_dir = Path(args.log_dir)
@@ -411,7 +404,7 @@ def main() -> None:
     state = StateStore(Path(args.state_file))
 
     def run_once(catch_errors: bool) -> None:
-        # Mirror this run's console output to its own logs/run_<timestamp>.txt.
+        # Mirror this run's console output to the day's logs/<YYYY-MM-DD>.log.
         # check_artists persists state itself on every path that mutates it
         # (per artist, on penalty, and after refreshing the followed list);
         # the finally below persists the day's call total as a backstop.
@@ -426,7 +419,7 @@ def main() -> None:
             if not catch_errors:
                 raise
             # In the polling loop, keep going after a failed run — but log the
-            # error into this run's file first.
+            # error into the day's file first.
             logger.exception("Error while checking artists")
         finally:
             # Persist the day's call total even if the run crashed or stopped

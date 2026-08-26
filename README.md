@@ -50,9 +50,9 @@ Or keep it running and poll every N seconds (e.g. every hour):
 python -m spotify_tracker.main --interval 3600
 ```
 
-Every run also saves a copy of its console output to its own timestamped
-file under `logs/` (e.g. `logs/run_2026-08-06_15-30-00.txt`) — one file per
-run, so with cron or `--interval` you get a separate log for each check.
+Every run also saves a copy of its console output to a dated file under
+`logs/` (e.g. `logs/2026-08-06.log`) — one file per day, so with cron or
+`--interval` every check on the same day is appended to that day's log.
 Change the location with `--log-dir`:
 ```bash
 python -m spotify_tracker.main --log-dir /var/log/spotify-tracker
@@ -84,7 +84,7 @@ python -m spotify_tracker.main --log-dir /var/log/spotify-tracker
   requests this run: N`), printed at the end of the run — and also when a
   rate limit stops the run early or it crashes — so you can see how close a
   run came to the limit. The count includes token refreshes and appears in
-  both the console and that run's `logs/` file.
+  both the console and that day's `logs/` file.
 - Spotify's daily quota for this app is about 105 requests, so the program
   keeps a running total of the calls it makes across every run of the
   calendar day (persisted in `state.json`, reset at UTC midnight) and stops
