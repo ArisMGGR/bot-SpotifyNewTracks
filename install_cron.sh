@@ -5,7 +5,11 @@
 # What it does:
 #   1. Creates a Python virtualenv in ./venv (if missing) and installs
 #      requirements.txt into it.
-#   2. Installs an hourly crontab entry that runs scripts/run_check.sh, which
+#   2. Runs the first-time setup (python -m spotify_tracker.setup): renames
+#      an old .env to config.env or creates config.env from
+#      config.env.example, and, when run from a terminal, asks for any
+#      missing settings and runs the Spotify login.
+#   3. Installs an hourly crontab entry that runs scripts/run_check.sh, which
 #      only performs a real check once ~25 hours have elapsed (see that file).
 #      The effective cadence is therefore ~25h using plain cron. Your current
 #      PATH (and CRON_INTERVAL_HOURS, if set) is saved to cron.env, which the
@@ -19,6 +23,7 @@
 #   ./install_cron.sh              # full setup + install cron job
 #   ./install_cron.sh --uninstall  # remove the cron job (leaves venv alone)
 #   ./install_cron.sh --no-venv    # skip venv/pip, only install the cron job
+#   ./install_cron.sh --no-setup   # skip the config.env setup and login
 #
 set -euo pipefail
 
@@ -32,6 +37,7 @@ CRON_ENV="${REPO_DIR}/cron.env"
 CRON_SCHEDULE="0 * * * *"
 
 DO_VENV=1
+DO_SETUP=1
 
 for arg in "$@"; do
     case "${arg}" in
@@ -44,6 +50,9 @@ for arg in "$@"; do
             ;;
         --no-venv)
             DO_VENV=0
+            ;;
+        --no-setup)
+            DO_SETUP=0
             ;;
         -h|--help)
             # Print only the header comment block (after the shebang).
@@ -74,19 +83,34 @@ fi
 chmod +x "${WRAPPER}"
 mkdir -p "${REPO_DIR}/logs"
 
-if [ ! -f "${REPO_DIR}/.env" ]; then
-    echo "WARNING: ${REPO_DIR}/.env not found. The scheduled run will fail"
-    echo "         until you create it (see README) and run:"
-    echo "           python -m spotify_tracker.login"
-fi
-
 if ! command -v flock >/dev/null 2>&1; then
     echo "WARNING: flock not found. scripts/run_check.sh needs it to run, so"
     echo "         every scheduled check will fail until you install it"
     echo "         (util-linux, or 'brew install flock' on macOS)."
 fi
 
-# --- 3. Save the environment the scheduled run needs ------------------------
+# --- 3. Settings and Spotify login -----------------------------------------
+# The same interpreter the scheduled run will use (see scripts/run_check.sh).
+if [ -x "${REPO_DIR}/venv/bin/python" ]; then
+    PYTHON="${REPO_DIR}/venv/bin/python"
+else
+    PYTHON="python3"
+fi
+
+if [ "${DO_SETUP}" -eq 1 ]; then
+    # Interactive only from a terminal; otherwise it just makes sure
+    # config.env exists and lists what's missing. A failed login doesn't stop
+    # the install: the cron job can go in now and the login be re-run later.
+    if ! (cd "${REPO_DIR}" && "${PYTHON}" -m spotify_tracker.setup); then
+        echo "WARNING: setup did not finish. Re-run it with:"
+        echo "           python -m spotify_tracker.setup"
+    fi
+elif [ ! -f "${REPO_DIR}/config.env" ] && [ ! -f "${REPO_DIR}/.env" ]; then
+    echo "WARNING: ${REPO_DIR}/config.env not found. The scheduled run will fail"
+    echo "         until you create it (python -m spotify_tracker.setup)."
+fi
+
+# --- 4. Save the environment the scheduled run needs ------------------------
 # Cron runs jobs with a minimal PATH (often just /usr/bin:/bin), so a flock or
 # python3 found here (e.g. Homebrew's /opt/homebrew/bin) would be missing in
 # the scheduled run. Save this shell's PATH, the one checked above, for the
@@ -101,7 +125,7 @@ fi
     fi
 } > "${CRON_ENV}"
 
-# --- 4. Install the cron entry (idempotent) ---------------------------------
+# --- 5. Install the cron entry (idempotent) ---------------------------------
 # Quote a path for the crontab command line, which cron hands to /bin/sh:
 # single-quote it (so spaces etc. survive) and escape "%", which cron would
 # otherwise turn into a newline.

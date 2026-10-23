@@ -15,7 +15,7 @@ whenever one of them releases a new album or single.
    - Under **Redirect URIs**, add exactly: `http://127.0.0.1:8888/callback`
      (if port 8888 is taken, register another, e.g.
      `http://127.0.0.1:9090/callback`, and set the same value as
-     `SPOTIFY_REDIRECT_URI` in `.env`; the login step listens on its port)
+     `SPOTIFY_REDIRECT_URI` in `config.env`; the login step listens on its port)
    - Check **Web API** and save.
    - On the app's **Settings** page, copy the **Client ID** and (after
      clicking "View client secret") the **Client secret**.
@@ -27,22 +27,30 @@ whenever one of them releases a new album or single.
    `https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates` in a browser and
    read the `chat.id` field from the response.
 
-5. **Configure secrets**: copy `.env.example` to `.env` and fill in
-   `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, `TELEGRAM_BOT_TOKEN`,
-   `TELEGRAM_CHAT_ID`:
+5. **Configure secrets and log in** (one-time):
    ```bash
-   cp .env.example .env
+   python -m spotify_tracker.setup
    ```
+   This creates `config.env` from `config.env.example`, asks for
+   `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, `TELEGRAM_BOT_TOKEN` and
+   `TELEGRAM_CHAT_ID` (press Enter to skip one), then offers to run the
+   Spotify login. `./install_cron.sh` runs this step for you. Re-running it
+   only asks for settings that are still empty, so it is safe to repeat.
+   An existing `.env` from before the rename is renamed to `config.env`.
 
-6. **Authorize the app to read your followed artists** (one-time):
+   To do it by hand instead, copy `config.env.example` to `config.env`, fill
+   in those four values, and continue with step 6.
+
+6. **Authorize the app to read your followed artists** (one-time, done by
+   step 5 if you let it):
    ```bash
    python -m spotify_tracker.login
    ```
    This opens your browser to log in and approve access, then saves
-   `SPOTIFY_REFRESH_TOKEN` into `.env` automatically. Spotify sends the
+   `SPOTIFY_REFRESH_TOKEN` into `config.env` automatically. Spotify sends the
    browser back to `127.0.0.1:8888` on the machine running the command, so
    on a server without a browser either run this step on your own computer
-   and copy the `SPOTIFY_REFRESH_TOKEN=` line into the server's `.env`, or
+   and copy the `SPOTIFY_REFRESH_TOKEN=` line into the server's `config.env`, or
    forward the port while it runs (`ssh -L 8888:127.0.0.1:8888 <server>`)
    and open the printed link locally. The login gives up after 5 minutes if
    no redirect arrives.
@@ -127,12 +135,12 @@ python -m spotify_tracker.main --log-dir /var/log/spotify-tracker
   the tracker used to apply, Spotify's API left out some releases that
   Spotify's own artist page lists, such as Bastille's collaborations with
   Misfits Together, so they were never alerted on. `SPOTIFY_MARKET` in
-  `.env` is now ignored.
+  `config.env` is now ignored.
 
 ### Features on other artists' releases ("Appears On")
 
 By default only an artist's own albums and singles are checked. To also get
-alerts when an artist features on someone else's record, list them in `.env`
+alerts when an artist features on someone else's record, list them in `config.env`
 (names as Spotify shows them, or Spotify artist IDs, comma-separated):
 ```
 APPEARS_ON_ARTISTS=Bastille, Eminem
@@ -164,17 +172,21 @@ From the repo root:
 This does the full setup in one command:
 
 1. Creates a virtualenv in `./venv` and installs `requirements.txt` into it.
-2. Installs a crontab entry that runs the check on a **~25-hour** cadence.
+2. Runs `python -m spotify_tracker.setup` (setup step 5): creates
+   `config.env` (or renames an old `.env`), asks for any missing settings and
+   offers to run the Spotify login. Run from a non-interactive shell, it only
+   creates the file and lists what's still missing.
+3. Installs a crontab entry that runs the check on a **~25-hour** cadence.
 
-You still need a configured `.env` and a completed one-time
-`python -m spotify_tracker.login` (the installer warns if `.env` is missing).
+If the login can't finish here (a server without a browser), the cron job is
+still installed; finish the login as described in setup step 6.
 
 To remove the schedule later:
 ```bash
 ./install_cron.sh --uninstall
 ```
-Other flags: `--no-venv` (install only the cron job, skip venv/pip),
-`--help`.
+Other flags: `--no-venv` (skip venv/pip), `--no-setup` (skip the
+`config.env` setup and login), `--help`.
 
 **Why 25 hours needs a wrapper.** Plain cron can't express "every 25 hours"
 — its fields are fixed clock times, so any attempt drifts. So the installed

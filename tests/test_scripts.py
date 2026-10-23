@@ -36,6 +36,8 @@ class ShellScriptTest(unittest.TestCase):
             ["bash", *args],
             cwd=self.root,
             env=dict(os.environ, **(env or {})),
+            # Not a terminal, so the installer's setup step never prompts.
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=60,
@@ -44,7 +46,7 @@ class ShellScriptTest(unittest.TestCase):
     def _cron_log(self) -> str:
         return (self.root / "logs" / "cron.log").read_text(encoding="utf-8")
 
-    def _install(self, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    def _install(self, env: dict[str, str] | None = None, *flags: str) -> subprocess.CompletedProcess:
         """Run install_cron.sh --no-venv with stub flock and crontab in a
         directory of their own (like Homebrew's: on the installer's PATH but
         not in cron's /usr/bin:/bin), and a stub venv python. The stubs record
@@ -63,7 +65,9 @@ class ShellScriptTest(unittest.TestCase):
 
         return self._run(
             "-c",
-            'PATH="$PWD/stubs:${EXTRA_PATH:+$EXTRA_PATH:}$PATH" bash install_cron.sh --no-venv',
+            'PATH="$PWD/stubs:${EXTRA_PATH:+$EXTRA_PATH:}$PATH" bash install_cron.sh --no-venv "$@"',
+            "install",
+            *flags,
             env=dict({"CRON_INTERVAL_HOURS": "", "EXTRA_PATH": ""}, **(env or {})),
         )
 
@@ -97,6 +101,18 @@ class ShellScriptTest(unittest.TestCase):
         self.assertNotIn("flock not found", cron_log)
         self.assertIn("PYTHON_RAN", cron_log)
         self.assertTrue((self.root / "stubs" / "flock-ran").exists())
+
+    def test_install_runs_the_setup_step_unless_skipped(self):
+        # The stub venv python stands in for spotify_tracker.setup.
+        result = self._install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("PYTHON_RAN", result.stdout)
+
+    def test_install_with_no_setup_skips_it_and_warns(self):
+        result = self._install(None, "--no-setup")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("PYTHON_RAN", result.stdout)
+        self.assertIn("config.env not found", result.stdout)
 
     def test_installed_entry_stays_short_with_a_long_path(self):
         # Cron silently cuts commands longer than ~1000 characters, so the

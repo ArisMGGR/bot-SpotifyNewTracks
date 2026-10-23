@@ -1,7 +1,7 @@
-# Secrets (keep the template)
+# Secrets (keep the template). .env is the settings file's old name.
+config.env
 .env
 .env.*
-!.env.example
 cron.env
 
 # Runtime state and logs

@@ -45,7 +45,7 @@ logger = logging.getLogger("spotify_tracker")
 
 # Each run also writes a copy of its console output to a file in this
 # directory, one file per calendar day. Defaults are anchored at the
-# repository root (like the .env), not the working directory, so running from
+# repository root (like config.env), not the working directory, so running from
 # elsewhere can't silently start over with an empty state file.
 DEFAULT_LOG_DIR = REPO_DIR / "logs"
 DEFAULT_STATE_FILE = REPO_DIR / "state.json"

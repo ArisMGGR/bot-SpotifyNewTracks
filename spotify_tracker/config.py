@@ -1,4 +1,4 @@
-"""Loads required settings from the environment (and a .env file)."""
+"""Loads required settings from the environment (and the config.env file)."""
 
 import os
 from dataclasses import dataclass
@@ -6,15 +6,28 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-# The repository root. The .env, state.json and logs/ all default to living
+# The repository root. config.env, state.json and logs/ all default to living
 # here, so a run finds the same files whatever the working directory.
 REPO_DIR = Path(__file__).resolve().parent.parent
 
-# The project's .env. Read here and written by spotify_tracker.login, so both
-# use the same file.
-ENV_PATH = REPO_DIR / ".env"
+# The project's settings file. Read here and written by spotify_tracker.login
+# and spotify_tracker.setup, so all of them use the same file.
+ENV_PATH = REPO_DIR / "config.env"
+# Its name before the rename. Still read when it's the only one there, so an
+# install that kept its old .env keeps working; spotify_tracker.setup (run by
+# install_cron.sh) renames it to config.env.
+LEGACY_ENV_PATH = REPO_DIR / ".env"
+TEMPLATE_PATH = REPO_DIR / "config.env.example"
 
-load_dotenv(ENV_PATH)
+
+def env_path() -> Path:
+    """config.env, or the legacy .env if that is the only one present."""
+    if not ENV_PATH.exists() and LEGACY_ENV_PATH.exists():
+        return LEGACY_ENV_PATH
+    return ENV_PATH
+
+
+load_dotenv(env_path())
 
 DEFAULT_REDIRECT_URI = "http://127.0.0.1:8888/callback"
 
@@ -51,7 +64,8 @@ def load_client_credentials() -> tuple[str, str, str]:
         raise SystemExit(
             "Missing required environment variables: "
             + ", ".join(missing)
-            + ". Copy .env.example to .env and fill in SPOTIFY_CLIENT_ID/SPOTIFY_CLIENT_SECRET first."
+            + ". Run 'python -m spotify_tracker.setup' (or copy config.env.example to config.env) "
+            "and fill in SPOTIFY_CLIENT_ID/SPOTIFY_CLIENT_SECRET first."
         )
     return client_id, client_secret, redirect_uri
 
