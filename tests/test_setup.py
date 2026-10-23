@@ -81,15 +81,65 @@ class SetupTest(unittest.TestCase):
         # The login reads the client credentials from the environment.
         self.assertEqual(os.environ["SPOTIFY_CLIENT_ID"], "new-id")
 
-    def test_only_missing_settings_are_asked_for(self):
+    def _write_complete_config(self):
         (self.root / "config.env").write_text(
-            "SPOTIFY_CLIENT_ID=id\nSPOTIFY_CLIENT_SECRET=secret\nSPOTIFY_REFRESH_TOKEN=token\n"
-            "TELEGRAM_BOT_TOKEN=bot\nTELEGRAM_CHAT_ID=\n",
+            "SPOTIFY_CLIENT_ID=old-id\nSPOTIFY_CLIENT_SECRET=old-secret-abcd\nSPOTIFY_REFRESH_TOKEN=token\n"
+            "TELEGRAM_BOT_TOKEN=old-bot-token-wxyz\nTELEGRAM_CHAT_ID=\n",
             encoding="utf-8",
         )
-        login_main = self._run(tty=True, inputs=["7"])
-        self.assertEqual(self._values()["TELEGRAM_CHAT_ID"], "7")
+
+    def test_enter_keeps_the_settings_already_set(self):
+        self._write_complete_config()
+        # Keep ID, secret, bot token; the chat ID is missing; keep the login.
+        login_main = self._run(tty=True, inputs=["", "", "", "7", ""])
+        values = self._values()
+        self.assertEqual(values["SPOTIFY_CLIENT_ID"], "old-id")
+        self.assertEqual(values["TELEGRAM_BOT_TOKEN"], "old-bot-token-wxyz")
+        self.assertEqual(values["TELEGRAM_CHAT_ID"], "7")
         login_main.assert_not_called()
+
+    def test_a_setting_already_set_can_be_replaced(self):
+        self._write_complete_config()
+        # Keep ID and secret, replace the bot token, chat ID, keep the login.
+        login_main = self._run(tty=True, inputs=["", "", "n", "7", ""], secrets=["new-bot-token"])
+        self.assertEqual(self._values()["TELEGRAM_BOT_TOKEN"], "new-bot-token")
+        login_main.assert_not_called()
+
+    def test_declining_to_replace_with_an_empty_value_keeps_the_old_one(self):
+        self._write_complete_config()
+        login_main = self._run(tty=True, inputs=["n", "", "", "", "", ""])
+        self.assertEqual(self._values()["SPOTIFY_CLIENT_ID"], "old-id")
+        login_main.assert_not_called()
+
+    def test_secrets_are_shown_only_by_their_last_characters(self):
+        self._write_complete_config()
+        with (
+            mock.patch("sys.stdin.isatty", return_value=True),
+            mock.patch("sys.stdout.isatty", return_value=True),
+            mock.patch("builtins.input", side_effect=["", "", "", "7", ""]) as ask,
+            mock.patch.object(setup.login, "main"),
+            mock.patch("builtins.print"),
+        ):
+            setup.main([])
+        prompts = " ".join(call.args[0] for call in ask.call_args_list)
+        self.assertIn("old-id", prompts)
+        self.assertIn("...abcd", prompts)
+        self.assertIn("...wxyz", prompts)
+        self.assertNotIn("old-secret", prompts)
+        self.assertNotIn("old-bot-token", prompts)
+
+    def test_declining_to_keep_the_login_runs_it_again(self):
+        self._write_complete_config()
+        login_main = self._run(tty=True, inputs=["", "", "", "7", "n"])
+        login_main.assert_called_once()
+
+    def test_new_spotify_credentials_offer_a_new_login(self):
+        self._write_complete_config()
+        # Replace the client ID; then the login is offered, not "keep it?".
+        login_main = self._run(tty=True, inputs=["n", "new-id", "", "", "7", ""])
+        self.assertEqual(self._values()["SPOTIFY_CLIENT_ID"], "new-id")
+        login_main.assert_called_once()
+        self.assertEqual(os.environ["SPOTIFY_CLIENT_ID"], "new-id")
 
     def test_skipped_client_credentials_skip_the_login(self):
         login_main = self._run(tty=True, inputs=["", ""], secrets=["", ""])

@@ -8,9 +8,13 @@ Run with: python -m spotify_tracker.setup
    spotify_tracker.bootstrap). --no-venv uses the current Python as it is.
 1. Renames a .env from before the rename to config.env, or creates config.env
    from config.env.example if there is neither.
-2. Asks for each required setting that is still empty or a template
-   placeholder. Pressing Enter leaves it as it is.
-3. Runs the Spotify login if there is no SPOTIFY_REFRESH_TOKEN yet.
+2. Goes through the required settings: asks for a value for each one still
+   empty or a template placeholder (Enter skips it), and asks whether to keep
+   each one already set (Enter keeps it; secrets are shown only by their last
+   4 characters).
+3. Offers the Spotify login if there is no SPOTIFY_REFRESH_TOKEN yet, or if
+   the client ID or secret was just changed (the old token only works with
+   the old app); otherwise asks whether to keep the existing login.
 
 With --non-interactive (or when not run from a terminal) steps 2 and 3 are
 skipped, and the settings still missing are listed.
@@ -69,26 +73,52 @@ def missing_settings() -> list[str]:
     return [name for name in names if _is_missing(values.get(name))]
 
 
-def prompt_for_settings() -> None:
+def _yes(prompt: str) -> bool:
+    """A [Y/n] question: Enter means yes."""
+    return input(prompt).strip().lower() in ("", "y", "yes")
+
+
+def _shown(value: str, secret: bool) -> str:
+    """A setting as printed in a prompt: secrets only by their last 4 characters."""
+    if not secret:
+        return value
+    return f"...{value[-4:]}" if len(value) > 8 else "(set)"
+
+
+def prompt_for_settings() -> set[str]:
+    """Asks for every setting: a new value for a missing one, or whether to
+    keep one that is already set. Returns the names that were changed."""
     values = dotenv_values(config.ENV_PATH)
+    changed: set[str] = set()
     for name, label, secret in PROMPTS:
-        if not _is_missing(values.get(name)):
-            continue
+        current = values.get(name)
         ask = getpass.getpass if secret else input
-        value = ask(f"{label} ({name}, Enter to skip): ").strip()
-        if value:
+        if _is_missing(current):
+            value = ask(f"{label} ({name}, Enter to skip): ").strip()
+        elif _yes(f"{label} ({name}) is {_shown(current, secret)}. Keep it? [Y/n]: "):
+            continue
+        else:
+            value = ask(f"New {label} ({name}, Enter to keep the current one): ").strip()
+        if value and value != current:
             set_env_value(config.ENV_PATH, name, value)
+            changed.add(name)
+    return changed
 
 
-def maybe_run_login() -> None:
+def maybe_run_login(changed: set[str] = frozenset()) -> None:
     values = dotenv_values(config.ENV_PATH)
-    if not _is_missing(values.get("SPOTIFY_REFRESH_TOKEN")):
-        return
     if _is_missing(values.get("SPOTIFY_CLIENT_ID")) or _is_missing(values.get("SPOTIFY_CLIENT_SECRET")):
         print("Skipping the Spotify login: SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET are needed first.")
         return
-    answer = input("Run the Spotify login now? It opens a browser on this machine. [Y/n]: ").strip().lower()
-    if answer not in ("", "y", "yes"):
+    have_token = not _is_missing(values.get("SPOTIFY_REFRESH_TOKEN"))
+    if have_token and {"SPOTIFY_CLIENT_ID", "SPOTIFY_CLIENT_SECRET"} & changed:
+        # A refresh token only works with the app it was issued to.
+        print("The Spotify app credentials changed, so the saved login (SPOTIFY_REFRESH_TOKEN) won't work with them.")
+        have_token = False
+    if have_token:
+        if _yes("Spotify login is already done (SPOTIFY_REFRESH_TOKEN is set). Keep it? [Y/n]: "):
+            return
+    elif not _yes("Run the Spotify login now? It opens a browser on this machine. [Y/n]: "):
         print("Skipped. Run 'python -m spotify_tracker.login' later (see README for servers without a browser).")
         return
     # Settings typed above aren't in os.environ yet; the login reads them there.
@@ -114,8 +144,8 @@ def main(argv: list[str] | None = None) -> None:
     # Both ends, not just stdin: Windows reports NUL (stdin from /dev/null) as
     # a terminal, and getpass there reads the console directly and would hang.
     if not args.non_interactive and sys.stdin.isatty() and sys.stdout.isatty():
-        prompt_for_settings()
-        maybe_run_login()
+        changed = prompt_for_settings()
+        maybe_run_login(changed)
 
     missing = missing_settings()
     if missing:

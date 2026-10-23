@@ -38,9 +38,15 @@ whenever one of them releases a new album or single.
    creates `config.env` from `config.env.example`, asks for
    `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, `TELEGRAM_BOT_TOKEN` and
    `TELEGRAM_CHAT_ID` (press Enter to skip one), and offers to run the
-   Spotify login. `./install_cron.sh` runs this step for you. Re-running it
-   only asks for settings that are still empty, so it is safe to repeat.
+   Spotify login. `./install_cron.sh` runs this step for you.
    An existing `.env` from before the rename is renamed to `config.env`.
+
+   Re-running it is safe: for each setting already in `config.env` it shows
+   the current value (secrets only by their last 4 characters) and asks
+   whether to keep it, with Enter keeping it; answer `n` to type a new one.
+   It also asks whether to keep the existing Spotify login, and offers a new
+   login on its own if you change the client ID or secret, since the old
+   login only works with the old Spotify app.
 
    Afterwards run the other commands with the venv's Python
    (`venv/bin/python`, or `venv\Scripts\python` on Windows), or activate the
