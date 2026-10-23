@@ -5,7 +5,9 @@ whenever one of them releases a new album or single.
 
 ## Setup
 
-1. **Install dependencies** (Python 3.10+):
+1. **Install dependencies** (Python 3.10+): nothing to do here if you use
+   step 5, which creates a virtualenv in `./venv` and installs them into it.
+   To install them yourself instead:
    ```bash
    pip install -r requirements.txt
    ```
@@ -31,12 +33,20 @@ whenever one of them releases a new album or single.
    ```bash
    python -m spotify_tracker.setup
    ```
-   This creates `config.env` from `config.env.example`, asks for
+   Run with any Python 3.10+, this first creates `./venv` (if missing),
+   installs `requirements.txt` into it and carries on inside it. It then
+   creates `config.env` from `config.env.example`, asks for
    `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, `TELEGRAM_BOT_TOKEN` and
-   `TELEGRAM_CHAT_ID` (press Enter to skip one), then offers to run the
+   `TELEGRAM_CHAT_ID` (press Enter to skip one), and offers to run the
    Spotify login. `./install_cron.sh` runs this step for you. Re-running it
    only asks for settings that are still empty, so it is safe to repeat.
    An existing `.env` from before the rename is renamed to `config.env`.
+
+   Afterwards run the other commands with the venv's Python
+   (`venv/bin/python`, or `venv\Scripts\python` on Windows), or activate the
+   venv first. Pass `--no-venv` to skip the virtualenv and use the Python you
+   ran it with (its dependencies must already be installed). On
+   Debian/Ubuntu, creating the venv needs `sudo apt install python3-venv`.
 
    To do it by hand instead, copy `config.env.example` to `config.env`, fill
    in those four values, and continue with step 6.

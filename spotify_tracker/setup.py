@@ -3,20 +3,30 @@
 Run with: python -m spotify_tracker.setup
 (install_cron.sh runs it for you.)
 
+0. Unless run with the project's own Python, creates ./venv if missing,
+   installs requirements.txt into it and continues inside it (see
+   spotify_tracker.bootstrap). --no-venv uses the current Python as it is.
 1. Renames a .env from before the rename to config.env, or creates config.env
    from config.env.example if there is neither.
 2. Asks for each required setting that is still empty or a template
    placeholder. Pressing Enter leaves it as it is.
 3. Runs the Spotify login if there is no SPOTIFY_REFRESH_TOKEN yet.
 
-With --non-interactive (or when not run from a terminal) only step 1 runs, and
-the settings still missing are listed.
+With --non-interactive (or when not run from a terminal) steps 2 and 3 are
+skipped, and the settings still missing are listed.
 """
 
 import argparse
 import getpass
 import shutil
 import sys
+
+if __name__ == "__main__":
+    # Before the imports below, which need the dependencies installed.
+    from spotify_tracker.bootstrap import ensure_venv
+
+    if not {"--no-venv", "-h", "--help"} & set(sys.argv[1:]):
+        ensure_venv(sys.argv[1:])
 
 from dotenv import dotenv_values, load_dotenv
 
@@ -92,6 +102,11 @@ def main(argv: list[str] | None = None) -> None:
         "--non-interactive",
         action="store_true",
         help="only create config.env; don't ask for settings or run the login",
+    )
+    parser.add_argument(
+        "--no-venv",
+        action="store_true",
+        help="use this Python as it is instead of ./venv (its dependencies must be installed)",
     )
     args = parser.parse_args(argv)
 

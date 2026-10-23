@@ -101,7 +101,14 @@ if [ "${DO_SETUP}" -eq 1 ]; then
     # Interactive only from a terminal; otherwise it just makes sure
     # config.env exists and lists what's missing. A failed login doesn't stop
     # the install: the cron job can go in now and the login be re-run later.
-    if ! (cd "${REPO_DIR}" && "${PYTHON}" -m spotify_tracker.setup); then
+    # With --no-venv, the setup mustn't create ./venv on its own either.
+    # (The ${...+...} form keeps an empty array legal under set -u in the
+    # bash 3.2 that macOS ships.)
+    SETUP_ARGS=()
+    if [ "${DO_VENV}" -eq 0 ]; then
+        SETUP_ARGS+=(--no-venv)
+    fi
+    if ! (cd "${REPO_DIR}" && "${PYTHON}" -m spotify_tracker.setup ${SETUP_ARGS[@]+"${SETUP_ARGS[@]}"}); then
         echo "WARNING: setup did not finish. Re-run it with:"
         echo "           python -m spotify_tracker.setup"
     fi

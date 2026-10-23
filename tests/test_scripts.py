@@ -59,7 +59,7 @@ class ShellScriptTest(unittest.TestCase):
             '#!/bin/sh\n[ "$1" = "-l" ] && exit 1\ncat > "$(dirname "$0")/crontab.out"\n', newline="\n"
         )
         (self.root / "venv" / "bin").mkdir(parents=True)
-        (self.root / "venv" / "bin" / "python").write_text("#!/bin/sh\necho PYTHON_RAN\n", newline="\n")
+        (self.root / "venv" / "bin" / "python").write_text('#!/bin/sh\necho PYTHON_RAN "$@"\n', newline="\n")
         for stub in (stubs / "flock", stubs / "crontab", self.root / "venv" / "bin" / "python"):
             stub.chmod(0o755)
 
@@ -103,10 +103,12 @@ class ShellScriptTest(unittest.TestCase):
         self.assertTrue((self.root / "stubs" / "flock-ran").exists())
 
     def test_install_runs_the_setup_step_unless_skipped(self):
-        # The stub venv python stands in for spotify_tracker.setup.
+        # The stub venv python stands in for spotify_tracker.setup. _install
+        # passes --no-venv, which the setup must get too, or it would build
+        # ./venv itself.
         result = self._install()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("PYTHON_RAN", result.stdout)
+        self.assertIn("PYTHON_RAN -m spotify_tracker.setup --no-venv", result.stdout)
 
     def test_install_with_no_setup_skips_it_and_warns(self):
         result = self._install(None, "--no-setup")
