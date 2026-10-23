@@ -8,12 +8,12 @@ Uses two separate token types:
   such as the list of artists they follow.
 """
 
-import logging
+import math
 import time
 
 import requests
 
-logger = logging.getLogger("spotify_tracker")
+from spotify_tracker.state import utc_today
 
 TOKEN_URL = "https://accounts.spotify.com/api/token"
 API_BASE = "https://api.spotify.com/v1"
@@ -26,6 +26,19 @@ API_BASE = "https://api.spotify.com/v1"
 RATE_LIMIT_WINDOW = 30.0  # seconds
 MAX_REQUESTS_PER_WINDOW = 5
 MIN_REQUEST_INTERVAL = RATE_LIMIT_WINDOW / MAX_REQUESTS_PER_WINDOW
+
+# Release groups checked for each artist, one request each (see
+# get_latest_releases), and how many of the newest releases to fetch per
+# group. Far more releases than this never come out between two checks.
+RELEASE_GROUPS = ("album", "single")
+RELEASES_PER_GROUP = 10
+
+# "Appears On" (other artists' releases an artist features on) is opt-in per
+# artist. Unlike albums and singles, Spotify doesn't list it newest first, so
+# it has to be read in full: one call per 10 releases. An artist whose list
+# would take more calls than this is only given its first page, so one artist
+# can't eat most of the day's budget.
+MAX_APPEARS_ON_CALLS = 50
 
 
 class SpotifyRateLimitError(Exception):
@@ -59,19 +72,43 @@ class SpotifyDailyLimitError(Exception):
         super().__init__(f"Daily Spotify call budget reached ({calls_today}/{limit})")
 
 
+class SpotifyUnavailableError(Exception):
+    """Raised when Spotify can't be used for the rest of this run: a request
+    never got an answer (network down, timeout), or an access token couldn't
+    be fetched (e.g. a revoked refresh token).
+
+    Every further request would fail the same way while still counting
+    toward the day's budget, so the caller must stop the run rather than
+    skip to the next artist.
+    """
+
+
+class AppearsOnBudgetError(Exception):
+    """Raised after the first page of an artist's "Appears On" list, when the
+    rest of the list won't fit in what's left of the day's budget.
+
+    Raised before the remaining pages are requested, so only that first call
+    is spent. calls_needed is what reading the list takes (all pages, or just
+    the first if the list is capped), so the caller can budget for it and
+    retry the artist on a later run.
+    """
+
+    def __init__(self, calls_needed: int):
+        self.calls_needed = calls_needed
+        super().__init__(f"Appears On list needs {calls_needed} calls")
+
+
 class SpotifyClient:
     def __init__(
         self,
         client_id: str,
         client_secret: str,
         refresh_token: str,
-        market: str | None = None,
         daily_call_limit: int | None = None,
     ):
         self._client_id = client_id
         self._client_secret = client_secret
         self._refresh_token = refresh_token
-        self._market = market
         self._app_token = None
         self._app_token_expiry = 0.0
         self._user_token = None
@@ -81,18 +118,31 @@ class SpotifyClient:
         # API calls). Reported per run so you can see how close a run came to
         # the rate limit, even when one stops it early.
         self.request_count = 0
-        # Running total of calls attributed to the current calendar day,
+        # Running total of calls attributed to the current UTC day (_day),
         # spanning every run of the day (persisted between runs by the caller
         # via start_day). Spotify's daily quota is what actually blocks the app
         # long-term, so this — not request_count — is what the budget guards.
-        self.daily_calls = 0
+        self._daily_calls = 0
+        self._day = utc_today()
         self._daily_call_limit = daily_call_limit
+
+    @property
+    def daily_calls(self) -> int:
+        """Calls counted toward the current UTC day. Resets to 0 when the day
+        changes, including in the middle of a run, so calls made before
+        midnight aren't charged to the new day's budget."""
+        today = utc_today()
+        if today != self._day:
+            self._day = today
+            self._daily_calls = 0
+        return self._daily_calls
 
     def start_day(self, calls_already_made: int) -> None:
         """Seed the day's running call total from persisted state at the start
         of a run, so the daily budget is enforced across separate runs (cron)
         as well as within one long-lived process (--interval)."""
-        self.daily_calls = calls_already_made
+        self._day = utc_today()
+        self._daily_calls = calls_already_made
 
     def _check_daily_budget(self) -> None:
         if self._daily_call_limit is not None and self.daily_calls >= self._daily_call_limit:
@@ -101,50 +151,14 @@ class SpotifyClient:
     def _account_request(self) -> None:
         """Refuse a request that would exceed the day's budget, otherwise count
         the one about to be sent (toward both the per-run and per-day totals)."""
-        self._check_daily_budget()
+        self._check_daily_budget()  # also rolls daily_calls over to a new day
         self.request_count += 1
-        self.daily_calls += 1
+        self._daily_calls += 1
 
-    def _get_app_token(self) -> str:
-        if self._app_token and time.time() < self._app_token_expiry:
-            return self._app_token
-
-        self._account_request()
-        response = requests.post(
-            TOKEN_URL,
-            data={"grant_type": "client_credentials"},
-            auth=(self._client_id, self._client_secret),
-            timeout=15,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        self._app_token = payload["access_token"]
-        self._app_token_expiry = time.time() + payload["expires_in"] - 60
-        return self._app_token
-
-    def _get_user_token(self) -> str:
-        if self._user_token and time.time() < self._user_token_expiry:
-            return self._user_token
-
-        self._account_request()
-        response = requests.post(
-            TOKEN_URL,
-            data={"grant_type": "refresh_token", "refresh_token": self._refresh_token},
-            auth=(self._client_id, self._client_secret),
-            timeout=15,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        self._user_token = payload["access_token"]
-        self._user_token_expiry = time.time() + payload["expires_in"] - 60
-        return self._user_token
-
-    def _get(self, url_or_path: str, params=None, *, auth: str = "app") -> dict:
-        if url_or_path.startswith("http"):
-            url = url_or_path
-        else:
-            url = f"{API_BASE}{url_or_path}"
-
+    def _send(self, method: str, url: str, **kwargs) -> requests.Response:
+        """Send one request to Spotify (token endpoint or Web API): refuse it
+        if the day's budget is spent, space it from the previous one, count
+        it, and raise SpotifyRateLimitError on a 429."""
         # Bail before the pacing sleep if the day's budget is already spent —
         # no point waiting 6 seconds for a call we're going to refuse.
         self._check_daily_budget()
@@ -155,11 +169,16 @@ class SpotifyClient:
         if elapsed < MIN_REQUEST_INTERVAL:
             time.sleep(MIN_REQUEST_INTERVAL - elapsed)
 
-        token = self._get_user_token() if auth == "user" else self._get_app_token()
-        headers = {"Authorization": f"Bearer {token}"}
         self._account_request()
-        response = requests.get(url, headers=headers, params=params, timeout=15)
-        self._last_request_at = time.time()
+        try:
+            response = requests.request(method, url, timeout=15, **kwargs)
+        except (requests.ConnectionError, requests.Timeout) as err:
+            raise SpotifyUnavailableError(f"Spotify unreachable: {type(err).__name__}: {err}") from err
+        finally:
+            # A failed request still reached (or tried to reach) Spotify, so it
+            # counts for pacing too; otherwise retries after a failure would go
+            # out back to back.
+            self._last_request_at = time.time()
 
         if response.status_code == 429:
             # Never retry in-process: any request during the penalty window
@@ -170,6 +189,45 @@ class SpotifyClient:
             except ValueError:
                 retry_after = 0
             raise SpotifyRateLimitError(retry_after)
+        return response
+
+    def _request_token(self, data: dict) -> dict:
+        response = self._send("POST", TOKEN_URL, data=data, auth=(self._client_id, self._client_secret))
+        if not response.ok:
+            # Spotify's body says why (e.g. "invalid_grant": the refresh token
+            # was revoked), which a bare "400 Bad Request" doesn't.
+            raise SpotifyUnavailableError(
+                f"Spotify token request ({data['grant_type']}) failed: {response.status_code} {response.text}"
+            )
+        return response.json()
+
+    def _get_app_token(self) -> str:
+        if self._app_token and time.time() < self._app_token_expiry:
+            return self._app_token
+
+        payload = self._request_token({"grant_type": "client_credentials"})
+        self._app_token = payload["access_token"]
+        self._app_token_expiry = time.time() + payload["expires_in"] - 60
+        return self._app_token
+
+    def _get_user_token(self) -> str:
+        if self._user_token and time.time() < self._user_token_expiry:
+            return self._user_token
+
+        payload = self._request_token({"grant_type": "refresh_token", "refresh_token": self._refresh_token})
+        self._user_token = payload["access_token"]
+        self._user_token_expiry = time.time() + payload["expires_in"] - 60
+        return self._user_token
+
+    def _get(self, url_or_path: str, params=None, *, auth: str = "app") -> dict:
+        if url_or_path.startswith("http"):
+            url = url_or_path
+        else:
+            url = f"{API_BASE}{url_or_path}"
+
+        token = self._get_user_token() if auth == "user" else self._get_app_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        response = self._send("GET", url, headers=headers, params=params)
 
         if not response.ok:
             # Surface Spotify's actual error body instead of a bare "400 Bad
@@ -196,28 +254,69 @@ class SpotifyClient:
 
         return artists
 
-    def _release_params(self) -> dict:
-        # A market filter hides releases not licensed in that market, so it
-        # must match where the user actually listens (SPOTIFY_MARKET,
-        # default GR) — not a hardcoded faraway market like the old "US".
-        params = {"include_groups": "album,single", "limit": 10}
-        if self._market:
-            params["market"] = self._market
-        return params
+    def get_latest_releases(self, artist_id: str) -> list[dict]:
+        """Return the artist's newest albums and newest singles: one request
+        per group in RELEASE_GROUPS, so every check costs the same few calls
+        regardless of catalog size.
 
-    def get_all_releases(self, artist_id: str) -> list[dict]:
-        """Return the artist's complete albums/singles catalog (every page).
+        Groups are requested separately because a combined
+        include_groups=album,single response lists every album before any
+        single, so a new single can sit many pages deep. Within one group,
+        Spotify lists the newest releases first.
 
-        Fetched on every check so no release can be missed because of Spotify's
-        page ordering. May raise SpotifyRateLimitError mid-pagination; the
-        caller must then discard the partial result rather than record it.
+        No market filter: with market=GR, Spotify's API left out Bastille's
+        collaborations with Misfits Together ("Oh America (1951)", "Only Name
+        I Own") even though they're listed on Bastille's page, so those
+        releases were never alerted on.
+
+        May raise SpotifyRateLimitError between groups; the caller must then
+        discard the partial result rather than record it.
         """
         releases: list[dict] = []
-        url = f"{API_BASE}/artists/{artist_id}/albums"
-        params = self._release_params()
-        while url:
-            data = self._get(url, params=params)
-            releases.extend(data.get("items", []))
-            url = data.get("next")
-            params = None
+        for group in RELEASE_GROUPS:
+            data = self._get(
+                f"/artists/{artist_id}/albums",
+                params={"include_groups": group, "limit": RELEASES_PER_GROUP},
+            )
+            releases.extend(_with_group(data.get("items", []), group))
         return releases
+
+    def get_appears_on(self, artist_id: str, reserve_calls: int = 0) -> tuple[list[dict], int]:
+        """Return the artist's "Appears On" releases, plus the number of calls
+        the full list takes.
+
+        The list isn't ordered by date, so it's read in full. If that would
+        take more than MAX_APPEARS_ON_CALLS, only the first page is returned
+        (the caller can tell from the call count). Raises AppearsOnBudgetError
+        after the first page if the rest, plus reserve_calls the caller still
+        needs afterwards, won't fit in today's budget.
+        """
+        url = f"{API_BASE}/artists/{artist_id}/albums"
+        data = self._get(url, params={"include_groups": "appears_on", "limit": RELEASES_PER_GROUP})
+        releases = _with_group(data.get("items", []), "appears_on")
+        calls_needed = max(1, math.ceil(data.get("total", 0) / RELEASES_PER_GROUP))
+        capped = calls_needed > MAX_APPEARS_ON_CALLS
+        pages_left = 0 if capped else calls_needed - 1
+
+        if (
+            self._daily_call_limit is not None
+            and self.daily_calls + pages_left + reserve_calls > self._daily_call_limit
+        ):
+            raise AppearsOnBudgetError(1 + pages_left)
+        if capped:
+            return releases, calls_needed
+
+        url = data.get("next")
+        while url:
+            data = self._get(url)
+            releases.extend(_with_group(data.get("items", []), "appears_on"))
+            url = data.get("next")
+        return releases, calls_needed
+
+
+def _with_group(releases: list[dict], group: str) -> list[dict]:
+    """Label each release with the group it was requested under. Spotify no
+    longer fills in album_group, and each request asks for one group only."""
+    for release in releases:
+        release["album_group"] = group
+    return releases

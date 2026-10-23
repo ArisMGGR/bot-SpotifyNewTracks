@@ -2,10 +2,19 @@
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()
+# The repository root. The .env, state.json and logs/ all default to living
+# here, so a run finds the same files whatever the working directory.
+REPO_DIR = Path(__file__).resolve().parent.parent
+
+# The project's .env. Read here and written by spotify_tracker.login, so both
+# use the same file.
+ENV_PATH = REPO_DIR / ".env"
+
+load_dotenv(ENV_PATH)
 
 DEFAULT_REDIRECT_URI = "http://127.0.0.1:8888/callback"
 
@@ -17,9 +26,11 @@ class Config:
     spotify_refresh_token: str
     telegram_bot_token: str
     telegram_chat_id: str
-    # ISO country code used to filter releases. load_config supplies the value
-    # (SPOTIFY_MARKET env var, defaulting to GR).
-    spotify_market: str
+    # Artists (names or Spotify IDs, lowercased) whose "Appears On" releases
+    # are also checked, from the comma-separated APPEARS_ON_ARTISTS env var.
+    # Splitting on commas means a name that itself contains one ("Tyler, The
+    # Creator") has to be given by Spotify ID instead.
+    appears_on_artists: frozenset[str]
 
 
 def _require(name: str, missing: list[str]) -> str:
@@ -67,5 +78,9 @@ def load_config() -> Config:
         spotify_refresh_token=refresh_token,
         telegram_bot_token=telegram_bot_token,
         telegram_chat_id=telegram_chat_id,
-        spotify_market=os.getenv("SPOTIFY_MARKET") or "GR",
+        appears_on_artists=frozenset(
+            name.strip().casefold()
+            for name in os.getenv("APPEARS_ON_ARTISTS", "").split(",")
+            if name.strip()
+        ),
     )

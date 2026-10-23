@@ -15,6 +15,11 @@ AUTHORIZE_URL = "https://accounts.spotify.com/authorize"
 TOKEN_URL = "https://accounts.spotify.com/api/token"
 SCOPE = "user-follow-read"
 
+# How long to wait for the browser to come back to the redirect URI. Without
+# a limit, a login on a machine the browser can't reach (a headless server)
+# would wait forever.
+CALLBACK_TIMEOUT = 300  # seconds
+
 
 class _CallbackHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
@@ -36,12 +41,29 @@ class _CallbackHandler(BaseHTTPRequestHandler):
         pass  # silence the default per-request access log
 
 
+class _CallbackServer(HTTPServer):
+    timeout = CALLBACK_TIMEOUT
+    timed_out = False
+
+    def handle_timeout(self) -> None:
+        self.timed_out = True
+
+
 def _wait_for_callback(port: int) -> tuple[str | None, str | None, str | None]:
-    server = HTTPServer(("127.0.0.1", port), _CallbackHandler)
-    server.auth_code = None  # type: ignore[attr-defined]
-    server.auth_error = None  # type: ignore[attr-defined]
-    server.auth_state = None  # type: ignore[attr-defined]
-    server.handle_request()  # blocks until the redirect hits this server, then stops
+    with _CallbackServer(("127.0.0.1", port), _CallbackHandler) as server:
+        server.auth_code = None  # type: ignore[attr-defined]
+        server.auth_error = None  # type: ignore[attr-defined]
+        server.auth_state = None  # type: ignore[attr-defined]
+        # Blocks until the redirect hits this server (or the timeout passes),
+        # then stops.
+        server.handle_request()
+    if server.timed_out:
+        raise SystemExit(
+            f"Spotify authorization failed: no browser redirect reached 127.0.0.1:{port} "
+            f"within {CALLBACK_TIMEOUT // 60} minutes. On a machine without a browser, run the "
+            "login on your own computer and copy SPOTIFY_REFRESH_TOKEN into this machine's .env "
+            "(see README)."
+        )
     return server.auth_code, server.auth_error, server.auth_state  # type: ignore[attr-defined]
 
 
@@ -81,7 +103,10 @@ def run_login_flow(client_id: str, client_secret: str, redirect_uri: str) -> str
         auth=(client_id, client_secret),
         timeout=15,
     )
-    response.raise_for_status()
+    if not response.ok:
+        # Spotify's body names the problem (e.g. "invalid_grant" for a
+        # redirect URI mismatch), which a bare status code doesn't.
+        raise SystemExit(f"Spotify token exchange failed: {response.status_code} {response.text}")
     refresh_token = response.json().get("refresh_token")
     if not refresh_token:
         raise SystemExit("Spotify did not return a refresh token.")

@@ -1,7 +1,28 @@
+# Secrets (keep the template)
 .env
+.env.*
+!.env.example
+cron.env
+
+# Runtime state and logs
 state.json
+state/
 logs/
+*.log
+*.tmp
+
+# Python
 __pycache__/
 *.pyc
 .venv/
 venv/
+
+# Local audit notes
+tests/FINDINGS.md
+tests/LOG.md
+tests/VERIFY.md
+
+# OS files (Windows dev machine, macOS supported by install_cron.sh)
+Thumbs.db
+desktop.ini
+.DS_Store

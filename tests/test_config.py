@@ -1,0 +1,56 @@
+import os
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from spotify_tracker import config, login
+from spotify_tracker.main import wants_appears_on
+
+REQUIRED = {
+    "SPOTIFY_CLIENT_ID": "id",
+    "SPOTIFY_CLIENT_SECRET": "secret",
+    "SPOTIFY_REFRESH_TOKEN": "refresh",
+    "TELEGRAM_BOT_TOKEN": "bot",
+    "TELEGRAM_CHAT_ID": "1",
+}
+
+
+class LoadConfigTest(unittest.TestCase):
+    def test_appears_on_artists_are_trimmed_and_casefolded(self):
+        env = dict(REQUIRED, APPEARS_ON_ARTISTS=" Bastille , ,EMINEM,bastille ")
+        with mock.patch.dict(os.environ, env, clear=True):
+            cfg = config.load_config()
+        self.assertEqual(cfg.appears_on_artists, frozenset({"bastille", "eminem"}))
+
+    def test_name_with_comma_matches_by_id(self):
+        artist = {"id": "4V8LLVI7PbaPR0K2TGSxFF", "name": "Tyler, The Creator"}
+        env = dict(REQUIRED, APPEARS_ON_ARTISTS="4V8LLVI7PbaPR0K2TGSxFF")
+        with mock.patch.dict(os.environ, env, clear=True):
+            cfg = config.load_config()
+        self.assertTrue(wants_appears_on(artist, cfg.appears_on_artists))
+
+    def test_missing_variables_exit(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(SystemExit) as ctx:
+                config.load_config()
+        self.assertIn("SPOTIFY_REFRESH_TOKEN", str(ctx.exception))
+
+
+class EnvPathTest(unittest.TestCase):
+    def test_env_path_is_the_repository_root(self):
+        repo_root = Path(__file__).resolve().parent.parent
+        self.assertEqual(config.ENV_PATH, repo_root / ".env")
+
+    def test_login_writes_the_file_config_reads(self):
+        with (
+            mock.patch.object(login, "load_client_credentials", return_value=("id", "secret", "uri")),
+            mock.patch.object(login, "run_login_flow", return_value="new-refresh-token"),
+            mock.patch.object(login, "set_env_value") as set_env_value,
+            mock.patch("builtins.print"),
+        ):
+            login.main()
+        set_env_value.assert_called_once_with(config.ENV_PATH, "SPOTIFY_REFRESH_TOKEN", "new-refresh-token")
+
+
+if __name__ == "__main__":
+    unittest.main()

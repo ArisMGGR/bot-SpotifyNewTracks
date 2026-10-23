@@ -7,14 +7,16 @@ File layout (state.json):
     "<artist_id>": {
       "name": "...",             # for human readability of the file
       "releases": ["<album_id>", ...],
-      "checked_at": 1751400000   # epoch seconds of the last successful check
+      "checked_at": 1751400000,  # epoch seconds of the last successful check
+      "last_cost": 3             # Spotify calls that check took (optional)
     }
   },
   "followed": {
     "fetched_at": 1751400000,
     "artists": [{"id": "...", "name": "..."}, ...]
   },
-  "rate_limited_until": 0     # epoch seconds; runs are skipped before this
+  "rate_limited_until": 0,    # epoch seconds; runs are skipped before this
+  "api_usage": {"date": "2026-10-23", "count": 42}   # calls on that UTC day
 }
 
 Older versions of this file were just {"<artist_id>": ["<album_id>", ...]};
@@ -23,12 +25,13 @@ overdue).
 """
 
 import json
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 
-def _today() -> str:
+def utc_today() -> str:
     """The current calendar day as YYYY-MM-DD in UTC. Spotify's daily quota
     resets on a fixed clock, so use UTC rather than local time so the reset is
     deterministic regardless of where the machine runs."""
@@ -72,14 +75,14 @@ class StateStore:
         """Spotify calls already counted for the current UTC day (0 if the
         stored tally is from an earlier day — i.e. the budget has reset)."""
         usage = self._data.get("api_usage")
-        if not usage or usage.get("date") != _today():
+        if not usage or usage.get("date") != utc_today():
             return 0
         return usage.get("count", 0)
 
     def set_api_calls_today(self, count: int) -> None:
         """Persist today's running call total, stamped with today's date so a
         new day is recognised as a fresh budget."""
-        self._data["api_usage"] = {"date": _today(), "count": int(count)}
+        self._data["api_usage"] = {"date": utc_today(), "count": int(count)}
 
     # --- rate-limit penalty persistence ---
 
@@ -104,11 +107,18 @@ class StateStore:
         return entry.get("checked_at", 0) if entry else 0
 
     def last_cost(self, artist_id: str) -> int | None:
-        """How many Spotify calls the previous full check of this artist took,
-        or None if never recorded. Used to predict whether checking them again
-        fits in the day's remaining budget."""
+        """How many Spotify calls the previous check of this artist took, or
+        None if never recorded."""
         entry = self._data["artists"].get(artist_id)
         return entry.get("last_cost") if entry else None
+
+    def set_last_cost(self, artist_id: str, cost: int) -> None:
+        """Update an already-tracked artist's expected cost without marking
+        them checked, so later runs budget for it. Untracked artists are left
+        alone: adding an entry would make them skip their silent baseline."""
+        entry = self._data["artists"].get(artist_id)
+        if entry is not None:
+            entry["last_cost"] = int(cost)
 
     def record_check(
         self, artist_id: str, name: str, release_ids: set[str], cost: int | None = None
@@ -119,7 +129,8 @@ class StateStore:
             "checked_at": int(time.time()),
         }
         if cost is not None:
-            # Remember what this check cost so the next run can budget for it.
+            # What this check cost. Used to budget for artists whose "Appears
+            # On" list is checked, whose cost varies with the list's size.
             entry["last_cost"] = int(cost)
         self._data["artists"][artist_id] = entry
 
@@ -140,5 +151,17 @@ class StateStore:
         }
 
     def save(self) -> None:
+        # Write a temporary file and swap it in, so an interrupted save (kill,
+        # power loss, full disk) leaves the previous state.json intact rather
+        # than a truncated one that every later run would fail to parse.
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(json.dumps(self._data, indent=2), encoding="utf-8")
+        tmp_path = self._path.with_name(self._path.name + ".tmp")
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(self._data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self._path)
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
