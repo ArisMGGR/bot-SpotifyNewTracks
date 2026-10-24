@@ -191,12 +191,44 @@ def make_notifier(config: Config) -> Notifier:
     return TelegramNotifier(config.telegram_bot_token, config.telegram_chat_id)
 
 
+# (artist name, new releases alerted on, when last checked before this run;
+# 0 if never).
+CheckedArtist = tuple[str, list[str], float]
+
+
+def log_checked_artists(summary: list[CheckedArtist]) -> None:
+    """End the run's output with one line per artist it checked:
+    artist - new release(s) (empty if none) - last check before this one."""
+    if not summary:
+        return
+    logger.info("Artists checked this run (artist - new release - last check before this one):")
+    for name, releases, previous in summary:
+        last = time.strftime("%Y-%m-%d %H:%M", time.localtime(previous)) if previous else "never"
+        logger.info("%s - %s - %s", name, ", ".join(releases), last)
+
+
 def check_artists(
     spotify: SpotifyClient,
     notifier: Notifier,
     state: StateStore,
     appears_on_artists: frozenset[str] = frozenset(),
 ) -> None:
+    summary: list[CheckedArtist] = []
+    try:
+        _check_artists(spotify, notifier, state, appears_on_artists, summary)
+    finally:
+        # Also when a rate limit or outage stops the run early.
+        log_checked_artists(summary)
+
+
+def _check_artists(
+    spotify: SpotifyClient,
+    notifier: Notifier,
+    state: StateStore,
+    appears_on_artists: frozenset[str],
+    summary: list[CheckedArtist],
+) -> None:
+    """check_artists' work; appends each artist it checks to summary."""
     penalty_left = state.rate_limited_until() - time.time()
     if penalty_left > 0:
         logger.warning(
@@ -252,6 +284,7 @@ def check_artists(
             display_name = artist["name"]
             progress.set_postfix_str(display_name)
             is_baseline = not state.has_artist(artist_id)
+            previous_check = state.checked_at(artist_id)
             with_appears_on = wants_appears_on(artist, appears_on_artists)
 
             # Once the day's budget can't cover even a plain check, stop: none
@@ -373,6 +406,7 @@ def check_artists(
                 state.set_api_calls_today(spotify.daily_calls)
                 state.save()
                 checked += 1
+                summary.append((display_name, [], previous_check))
                 logger.info(
                     "Baseline recorded for %s (%d releases, %d API calls)",
                     display_name,
@@ -395,6 +429,7 @@ def check_artists(
             # no market filter, Spotify can list one release under several
             # regional IDs; alert once and mark the duplicates known.
             alerted = set()
+            alerted_names = []
             for release in new_releases:
                 is_appears_on = release.get("album_group") == "appears_on"
                 if not released_recently(release.get("release_date")) or (
@@ -447,6 +482,7 @@ def check_artists(
                     continue
                 resolved_ids.add(release["id"])
                 alerted.add(release_key)
+                alerted_names.append(release["name"])
                 logger.info("Notified about new release: %s - %s", display_name, release["name"])
             if absorbed:
                 logger.info(
@@ -462,6 +498,7 @@ def check_artists(
             state.set_api_calls_today(spotify.daily_calls)
             state.save()
             checked += 1
+            summary.append((display_name, alerted_names, previous_check))
 
     if budget_deferred:
         logger.info(

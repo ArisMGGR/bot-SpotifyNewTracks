@@ -128,6 +128,13 @@ python -m spotify_tracker.main --log-dir /var/log/spotify-tracker
   rate limit stops the run early or it crashes — so you can see how close a
   run came to the limit. The count includes token refreshes and appears in
   both the console and that day's `logs/` file.
+- Each run ends with one line for every artist it checked, in the form
+  `artist - new release - last check before this one`, for example
+  `Bastille - ODYSSEY - 2026-10-23 09:12`. The middle part is empty when
+  there was no new release (`Eminem -  - 2026-10-23 09:15`), and the last
+  is `never` for an artist checked for the first time. Several new releases
+  are separated by commas. The list is printed even when a rate limit or an
+  outage stops the run early.
 - Spotify's daily quota for this app is about 105 requests, so the program
   keeps a running total of the calls it makes across every run of the
   calendar day (persisted in `state.json`, reset at UTC midnight) and stops

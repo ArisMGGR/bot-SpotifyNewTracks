@@ -212,6 +212,52 @@ class CheckArtistsTest(unittest.TestCase):
         # remaining artist one by one.
         self.assertTrue(any("deferring the remaining 1 artists" in line for line in logs.output), logs.output)
 
+    def _summary(self, spotify) -> list[str]:
+        """The run's log messages from the per-artist summary on."""
+        with (
+            mock.patch.object(main.logger, "disabled", False),
+            self.assertLogs(main.logger, "INFO") as logs,
+        ):
+            check_artists(spotify, FakeTelegram(), self.state)
+        messages = [record.getMessage() for record in logs.records]
+        start = next(i for i, m in enumerate(messages) if m.startswith("Artists checked this run"))
+        return messages[start + 1 :]
+
+    def test_run_ends_with_each_checked_artist_its_release_and_last_check(self):
+        self._follow("a1", "Old Friend", known=set())
+        self._follow("a2", "Quiet One", known=set())
+        self._follow("a3", "Newcomer")
+        last = time.strftime("%Y-%m-%d %H:%M", time.localtime(self.state.checked_at("a1")))
+        spotify = FakeSpotify({"a1": [_release("r1", "New Song", _days_ago(1))], "a3": []})
+
+        lines = self._summary(spotify)
+
+        self.assertEqual(
+            sorted(lines),
+            sorted([
+                f"Old Friend - New Song - {last}",
+                f"Quiet One -  - {last}",
+                "Newcomer -  - never",
+            ]),
+        )
+
+    def test_summary_is_logged_when_a_rate_limit_stops_the_run(self):
+        self._follow("a1", "First", known=set())
+        self._follow("a2", "Second", known=set())
+        spotify = FakeSpotify({"a1": []})
+        real_fetch = spotify.get_latest_releases
+
+        def fetch(artist_id):
+            if spotify.fetched:
+                raise main.SpotifyRateLimitError(60)
+            return real_fetch(artist_id)
+
+        spotify.get_latest_releases = fetch
+        with mock.patch.object(main, "record_penalty"):
+            lines = self._summary(spotify)
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith("First -  - "), lines)
+
     def test_network_outage_stops_the_run_after_one_request(self):
         for i in range(3):
             self._follow(f"a{i}", f"Artist {i}", known=set())
