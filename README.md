@@ -1,7 +1,8 @@
 # Spotify New Tracks Notifier
 
-Watches the artists you follow on Spotify and sends you a Telegram message
-whenever one of them releases a new album or single.
+Watches the artists you follow on Spotify and sends you a Telegram or
+Discord message whenever one of them releases a new album or single. With
+Discord, a bot also answers commands (`/check`, `/status`, ...) from you.
 
 ## Setup
 
@@ -22,8 +23,10 @@ whenever one of them releases a new album or single.
    - On the app's **Settings** page, copy the **Client ID** and (after
      clicking "View client secret") the **Client secret**.
 
-3. **Create a Telegram bot**: message [@BotFather](https://t.me/BotFather),
-   run `/newbot`, and copy the bot token it gives you.
+3. **Create a Telegram bot** (to get alerts on Telegram; for Discord see
+   [Discord](#discord) and skip step 4): message
+   [@BotFather](https://t.me/BotFather), run `/newbot`, and copy the bot
+   token it gives you.
 
 4. **Get your chat ID**: message your new bot once, then open
    `https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates` in a browser and
@@ -35,9 +38,12 @@ whenever one of them releases a new album or single.
    ```
    Run with any Python 3.10+, this first creates `./venv` (if missing),
    installs `requirements.txt` into it and carries on inside it. It then
-   creates `config.env` from `config.env.example`, asks for
-   `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, `TELEGRAM_BOT_TOKEN` and
-   `TELEGRAM_CHAT_ID` (press Enter to skip one), and offers to run the
+   creates `config.env` from `config.env.example` and asks whether alerts go
+   to Telegram or Discord (Enter keeps the current choice, Telegram at
+   first). It asks for `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET`, then
+   for the chosen service's settings (`TELEGRAM_BOT_TOKEN` and
+   `TELEGRAM_CHAT_ID`, or the Discord ones described in
+   [Discord](#discord)); press Enter to skip one. Last, it offers to run the
    Spotify login. `./install_cron.sh` runs this step for you.
    An existing `.env` from before the rename is renamed to `config.env`.
 
@@ -55,7 +61,8 @@ whenever one of them releases a new album or single.
    Debian/Ubuntu, creating the venv needs `sudo apt install python3-venv`.
 
    To do it by hand instead, copy `config.env.example` to `config.env`, fill
-   in those four values, and continue with step 6.
+   in the Spotify client ID and secret and the settings of the service set in
+   `NOTIFIER`, and continue with step 6.
 
 6. **Authorize the app to read your followed artists** (one-time, done by
    step 5 if you let it):
@@ -130,8 +137,7 @@ python -m spotify_tracker.main --log-dir /var/log/spotify-tracker
   check that would hit the limit halfway. The unchecked artists stay "most
   overdue" and go first once the budget resets. Each artist's actual cost is
   saved as `last_cost` in `state.json`.
-- Only unseen releases dated within the last 30 days trigger a Telegram
-  message. Older unseen IDs (Spotify catalog noise: reissues, regional
+- Only unseen releases dated within the last 30 days trigger an alert. Older unseen IDs (Spotify catalog noise: reissues, regional
   editions, relinked duplicates) are absorbed into the state silently. If
   one check finds the same new release twice under different IDs (same name
   and date), you get one alert.
@@ -192,7 +198,10 @@ This does the full setup in one command:
    `config.env` (or renames an old `.env`), asks for any missing settings and
    offers to run the Spotify login. Run from a non-interactive shell, it only
    creates the file and lists what's still missing.
-3. Installs a crontab entry that runs the check on a **~25-hour** cadence.
+3. With `NOTIFIER=discord`, installs the Discord bot as the systemd service
+   `spotify-tracker-bot.service` (see [Discord](#discord); skip it with
+   `--no-bot-service`).
+4. Installs a crontab entry that runs the check on a **~25-hour** cadence.
 
 If the login can't finish here (a server without a browser), the cron job is
 still installed; finish the login as described in setup step 6.
@@ -201,8 +210,12 @@ To remove the schedule later:
 ```bash
 ./install_cron.sh --uninstall
 ```
+This leaves the Discord bot service alone; remove that with
+`./install_bot_service.sh --uninstall`.
+
 Other flags: `--no-venv` (skip venv/pip), `--no-setup` (skip the
-`config.env` setup and login), `--help`.
+`config.env` setup and login), `--no-bot-service` (don't install the Discord
+bot service), `--help`.
 
 **Why 25 hours needs a wrapper.** Plain cron can't express "every 25 hours"
 — its fields are fixed clock times, so any attempt drifts. So the installed
@@ -234,15 +247,112 @@ The scheduled job uses `./venv/bin/python` if present, otherwise the system
 If you'd rather manage cron yourself, add a one-off check per run, e.g. every
 30 minutes:
 ```
-*/30 * * * * cd /path/to/server_SpotifyNewTracks && /usr/bin/python3 -m spotify_tracker.main >> tracker.log 2>&1
+*/30 * * * * cd /path/to/bot-SpotifyNewTracks && venv/bin/python -m spotify_tracker.main >> tracker.log 2>&1
 ```
 
 Or just leave it running in the foreground/background with `--interval`.
+Neither of these honours the Discord bot's `/pause`, which only stops
+`scripts/run_check.sh`.
+
+### Reinstalling or moving to another machine
+
+Keep these from the old copy and put them in the new repo root:
+
+- `config.env`: your settings and the Spotify login.
+- `state.json`: the releases already seen, the cached artist list, the
+  day's API call count and any rate-limit wait. Without it every artist gets
+  a new baseline and today's call budget starts again from 0.
+- Optionally `logs/`, `state/last_cron_run` (when the last scheduled check
+  ran) and `state/paused`.
+
+`venv/` and `cron.env` are rebuilt by `./install_cron.sh`, so don't copy
+them.
+
+## Discord
+
+Alerts can go to a channel in your Discord server instead of Telegram. The
+scheduled checks still run from cron; a separate bot, running as a systemd
+service, answers commands from one Discord user (you).
+
+### 1. Create the bot
+
+1. At https://discord.com/developers/applications click **New Application**.
+2. On the **Bot** page click **Reset Token** and copy the token. No
+   privileged intents are needed.
+3. In Discord, turn on **Developer Mode** (User Settings → Advanced), then
+   right-click your server → **Copy Server ID**, and your own name →
+   **Copy User ID**.
+
+### 2. Run the setup
+
+```bash
+python -m spotify_tracker.setup
+```
+Answer `discord` to "Send alerts with Telegram or Discord?", then give the
+bot token, the server ID and your user ID. The setup connects with the
+token, lists the server's text channels and asks which one the alerts go
+to, then offers to post a test message there. If the bot isn't in the
+server yet, it prints an invite link (with the bot's permissions and slash
+commands); open it, add the bot, and run the setup again.
+
+The setup saves these to `config.env` (to edit it by hand instead):
+
+| Setting | Value |
+|---|---|
+| `NOTIFIER` | `discord` |
+| `DISCORD_BOT_TOKEN` | The bot token. |
+| `DISCORD_GUILD_ID` | The server ID. |
+| `DISCORD_USER_ID` | Your user ID: the only user whose commands the bot answers. |
+| `DISCORD_CHANNEL_ID` | The alert channel's ID (right-click it → **Copy Channel ID**). |
+
+Re-running the setup offers to keep the current channel, unless you changed
+the token or the server.
+
+### 3. Start the bot service
+
+`./install_cron.sh` installs it for you when `NOTIFIER=discord` (it asks
+for your sudo password). To install or update just the service:
+```bash
+./install_bot_service.sh
+```
+It runs `python -m spotify_tracker.discord_bot` as you, from this folder,
+and starts at boot. Manage it like any service:
+```bash
+sudo systemctl restart spotify-tracker-bot.service
+```
+```bash
+sudo systemctl status spotify-tracker-bot.service
+```
+```bash
+journalctl -u spotify-tracker-bot.service -f
+```
+The bot reads the token, server and user ID when it starts, so restart it
+after changing them. If `config.env` is incomplete the bot exits and systemd
+doesn't keep restarting it; fix the settings, then restart it. Remove it with
+`./install_bot_service.sh --uninstall`, and print the unit file without
+installing it with `./install_bot_service.sh --print`. On a machine without
+systemd, run `python -m spotify_tracker.discord_bot` yourself instead.
+
+### Commands
+
+The commands appear in your server only and answer only the user in
+`DISCORD_USER_ID`; anyone else gets a refusal. Replies are visible only to
+you.
+
+| Command | What it does |
+|---|---|
+| `/check` | Runs a check now and replies with its last log lines. Refused while another check (the scheduled one) is running. |
+| `/status` | Next scheduled check, last artist checked, followed artists, Spotify API calls used today, any rate-limit pause, and the alert channel. |
+| `/channel` | Changes the channel the alerts go to (saved to `config.env`). The bot needs View Channel and Send Messages there. |
+| `/pause` | Stops the scheduled checks (creates `state/paused`). `/check` still works. |
+| `/resume` | Restarts them. |
 
 ## Development
 
-The unit tests use only the standard library and never call Spotify or
-Telegram. Run them from the repo root:
+The unit tests use the standard library's `unittest` plus the packages in
+`requirements.txt`, and never call Spotify, Telegram or Discord (the Discord
+bot's tests run only when discord.py is installed). Run them from the repo
+root:
 ```bash
 python -m unittest
 ```

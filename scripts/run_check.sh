@@ -9,9 +9,11 @@
 # cadence using nothing but plain cron.
 #
 # A timestamp of the last real run is kept in state/last_cron_run. A lock
-# (flock) prevents two checks from overlapping. Everything the wrapper and the
-# check print is appended to logs/cron.log. The PATH and interval saved by
-# install_cron.sh are read from cron.env.
+# (flock) prevents two checks from overlapping, including one started by the
+# Discord bot's /check. While state/paused exists (the bot's /pause) every
+# tick is skipped. Everything the wrapper and the check print is appended to
+# logs/cron.log. The PATH and interval saved by install_cron.sh are read from
+# cron.env.
 #
 set -euo pipefail
 
@@ -60,7 +62,14 @@ MIN_GAP_SECONDS=$(( INTERVAL_HOURS * 3600 - 1800 ))
 STATE_DIR="${REPO_DIR}/state"
 STAMP_FILE="${STATE_DIR}/last_cron_run"
 LOCK_FILE="${STATE_DIR}/cron.lock"
+PAUSE_FILE="${STATE_DIR}/paused"
 mkdir -p "${STATE_DIR}"
+
+# Paused from Discord: skip quietly, like a tick that isn't due, so the
+# hourly cron log isn't spammed. /resume removes the file.
+if [ -f "${PAUSE_FILE}" ]; then
+    exit 0
+fi
 
 # Pick the interpreter: prefer the project venv, else fall back to system.
 if [ -x "${REPO_DIR}/venv/bin/python" ]; then

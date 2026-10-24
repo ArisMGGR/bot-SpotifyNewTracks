@@ -23,7 +23,7 @@ VENV_DIR = REPO_DIR / "venv"
 REQUIREMENTS = REPO_DIR / "requirements.txt"
 
 # Import names of the packages in requirements.txt.
-REQUIRED_MODULES = ("requests", "dotenv", "tqdm")
+REQUIRED_MODULES = ("requests", "dotenv", "tqdm", "discord")
 
 # Set on the re-run inside the venv, so a venv that doesn't look like one to
 # in_venv() can't make the setup start itself over and over.

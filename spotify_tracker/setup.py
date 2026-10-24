@@ -8,15 +8,18 @@ Run with: python -m spotify_tracker.setup
    spotify_tracker.bootstrap). --no-venv uses the current Python as it is.
 1. Renames a .env from before the rename to config.env, or creates config.env
    from config.env.example if there is neither.
-2. Goes through the required settings: asks for a value for each one still
-   empty or a template placeholder (Enter skips it), and asks whether to keep
-   each one already set (Enter keeps it; secrets are shown only by their last
-   4 characters).
-3. Offers the Spotify login if there is no SPOTIFY_REFRESH_TOKEN yet, or if
+2. Asks whether alerts go to Telegram or Discord.
+3. Goes through the settings that choice needs: asks for a value for each one
+   still empty or a template placeholder (Enter skips it), and asks whether
+   to keep each one already set (Enter keeps it; secrets are shown only by
+   their last 4 characters).
+4. For Discord, connects with the bot token, lists the server's text channels
+   and lets you pick the one the alerts go to.
+5. Offers the Spotify login if there is no SPOTIFY_REFRESH_TOKEN yet, or if
    the client ID or secret was just changed (the old token only works with
    the old app); otherwise asks whether to keep the existing login.
 
-With --non-interactive (or when not run from a terminal) steps 2 and 3 are
+With --non-interactive (or when not run from a terminal) steps 2 to 5 are
 skipped, and the settings still missing are listed.
 """
 
@@ -35,15 +38,26 @@ if __name__ == "__main__":
 from dotenv import dotenv_values, load_dotenv
 
 from spotify_tracker import config, login
+from spotify_tracker.discord_api import DiscordAPI, DiscordError, invite_url
 from spotify_tracker.env_file import set_env_value
 
 # (name, prompt, secret). Secrets are read without echoing them.
-PROMPTS = [
+SPOTIFY_PROMPTS = [
     ("SPOTIFY_CLIENT_ID", "Spotify Client ID", False),
     ("SPOTIFY_CLIENT_SECRET", "Spotify Client secret", True),
-    ("TELEGRAM_BOT_TOKEN", "Telegram bot token", True),
-    ("TELEGRAM_CHAT_ID", "Telegram chat ID", False),
 ]
+NOTIFIER_PROMPTS = {
+    "telegram": [
+        ("TELEGRAM_BOT_TOKEN", "Telegram bot token", True),
+        ("TELEGRAM_CHAT_ID", "Telegram chat ID", False),
+    ],
+    # DISCORD_CHANNEL_ID is picked from a list instead (pick_discord_channel).
+    "discord": [
+        ("DISCORD_BOT_TOKEN", "Discord bot token", True),
+        ("DISCORD_GUILD_ID", "Discord server ID", False),
+        ("DISCORD_USER_ID", "Discord user ID allowed to use the bot's commands", False),
+    ],
+}
 
 # The template's stand-in values all start with this.
 PLACEHOLDER_PREFIX = "your_"
@@ -51,6 +65,11 @@ PLACEHOLDER_PREFIX = "your_"
 
 def _is_missing(value: str | None) -> bool:
     return not value or value.startswith(PLACEHOLDER_PREFIX)
+
+
+def _notifier(values: dict) -> str:
+    notifier = (values.get("NOTIFIER") or config.DEFAULT_NOTIFIER).strip().lower()
+    return notifier if notifier in config.NOTIFIERS else config.DEFAULT_NOTIFIER
 
 
 def ensure_config_file() -> None:
@@ -69,7 +88,8 @@ def ensure_config_file() -> None:
 
 def missing_settings() -> list[str]:
     values = dotenv_values(config.ENV_PATH)
-    names = [name for name, _, _ in PROMPTS] + ["SPOTIFY_REFRESH_TOKEN"]
+    names = ["SPOTIFY_CLIENT_ID", "SPOTIFY_CLIENT_SECRET", "SPOTIFY_REFRESH_TOKEN"]
+    names += config.NOTIFIER_SETTINGS[_notifier(values)]
     return [name for name in names if _is_missing(values.get(name))]
 
 
@@ -85,12 +105,26 @@ def _shown(value: str, secret: bool) -> str:
     return f"...{value[-4:]}" if len(value) > 8 else "(set)"
 
 
-def prompt_for_settings() -> set[str]:
-    """Asks for every setting: a new value for a missing one, or whether to
-    keep one that is already set. Returns the names that were changed."""
+def choose_notifier() -> str:
+    """Asks where alerts go, Enter keeping the current choice. Returns it."""
+    current = _notifier(dotenv_values(config.ENV_PATH))
+    while True:
+        answer = input(f"Send alerts with Telegram or Discord? [{current}]: ").strip().lower()
+        choice = {"": current, "t": "telegram", "d": "discord"}.get(answer, answer)
+        if choice in config.NOTIFIERS:
+            break
+        print("Please answer telegram or discord.")
+    set_env_value(config.ENV_PATH, "NOTIFIER", choice)
+    return choice
+
+
+def prompt_for_settings(notifier: str) -> set[str]:
+    """Asks for every setting the notifier needs: a new value for a missing
+    one, or whether to keep one that is already set. Returns the names that
+    were changed."""
     values = dotenv_values(config.ENV_PATH)
     changed: set[str] = set()
-    for name, label, secret in PROMPTS:
+    for name, label, secret in SPOTIFY_PROMPTS + NOTIFIER_PROMPTS[notifier]:
         current = values.get(name)
         ask = getpass.getpass if secret else input
         if _is_missing(current):
@@ -103,6 +137,75 @@ def prompt_for_settings() -> set[str]:
             set_env_value(config.ENV_PATH, name, value)
             changed.add(name)
     return changed
+
+
+def _explain_discord_error(api: DiscordAPI, guild_id: str, err: DiscordError) -> None:
+    if err.status == 401:
+        print("Discord rejected the bot token (DISCORD_BOT_TOKEN). Copy it again from the Bot page of your app.")
+        return
+    if err.status in (403, 404):
+        print(f"The bot can't see server {guild_id}: it hasn't been added to it, or the server ID is wrong.")
+        try:
+            print(f"Add it with this link, then run the setup again:\n  {invite_url(api.current_user()['id'])}")
+        except DiscordError:
+            pass
+        return
+    print(f"Couldn't reach Discord: {err}")
+
+
+def pick_discord_channel(changed: set[str] = frozenset()) -> None:
+    """Lists the server's text channels and saves the chosen one as
+    DISCORD_CHANNEL_ID. A channel already set can be kept, unless the token
+    or server just changed."""
+    values = dotenv_values(config.ENV_PATH)
+    token, guild_id = values.get("DISCORD_BOT_TOKEN"), values.get("DISCORD_GUILD_ID")
+    if _is_missing(token) or _is_missing(guild_id):
+        print("Skipping the channel choice: DISCORD_BOT_TOKEN and DISCORD_GUILD_ID are needed first.")
+        return
+
+    api = DiscordAPI(token)
+    print("Connecting to Discord ...")
+    try:
+        guild = api.guild(guild_id)
+        channels = api.text_channels(guild_id)
+    except DiscordError as err:
+        _explain_discord_error(api, guild_id, err)
+        return
+    if not channels:
+        print(f"Server {guild['name']} has no text channels to send alerts to.")
+        return
+
+    current = values.get("DISCORD_CHANNEL_ID")
+    by_id = {c["id"]: c for c in channels}
+    if current in by_id and not {"DISCORD_BOT_TOKEN", "DISCORD_GUILD_ID"} & changed:
+        if _yes(f"Alerts go to #{by_id[current]['name']} in {guild['name']}. Keep it? [Y/n]: "):
+            return
+
+    print(f"Text channels in {guild['name']}:")
+    for number, channel in enumerate(channels, start=1):
+        category = f"  ({channel['category']})" if channel["category"] else ""
+        print(f"  {number}. #{channel['name']}{category}")
+    while True:
+        answer = input(f"Channel for the alerts [1-{len(channels)}, Enter to skip]: ").strip()
+        if not answer:
+            print("Skipped. Run the setup again to pick a channel.")
+            return
+        if answer.isdigit() and 1 <= int(answer) <= len(channels):
+            break
+        print(f"Please type a number from 1 to {len(channels)}.")
+    channel = channels[int(answer) - 1]
+    set_env_value(config.ENV_PATH, "DISCORD_CHANNEL_ID", channel["id"])
+    print(f"Alerts will go to #{channel['name']}.")
+
+    if _yes("Send a test message there? [Y/n]: "):
+        try:
+            api.send_message(channel["id"], "Spotify New Tracks is set up: new releases will be posted here.")
+            print("Sent. Check the channel.")
+        except DiscordError as err:
+            if err.status == 403:
+                print(f"The bot isn't allowed to post in #{channel['name']}: give it the Send Messages permission there.")
+            else:
+                print(f"The test message failed: {err}")
 
 
 def maybe_run_login(changed: set[str] = frozenset()) -> None:
@@ -144,7 +247,10 @@ def main(argv: list[str] | None = None) -> None:
     # Both ends, not just stdin: Windows reports NUL (stdin from /dev/null) as
     # a terminal, and getpass there reads the console directly and would hang.
     if not args.non_interactive and sys.stdin.isatty() and sys.stdout.isatty():
-        changed = prompt_for_settings()
+        notifier = choose_notifier()
+        changed = prompt_for_settings(notifier)
+        if notifier == "discord":
+            pick_discord_channel(changed)
         maybe_run_login(changed)
 
     missing = missing_settings()

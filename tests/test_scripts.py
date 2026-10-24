@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -30,6 +31,7 @@ class ShellScriptTest(unittest.TestCase):
         (self.root / "scripts").mkdir()
         shutil.copy(REPO_DIR / "scripts" / "run_check.sh", self.root / "scripts")
         shutil.copy(REPO_DIR / "install_cron.sh", self.root)
+        shutil.copy(REPO_DIR / "install_bot_service.sh", self.root)
 
     def _run(self, *args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
         return subprocess.run(
@@ -152,6 +154,66 @@ class ShellScriptTest(unittest.TestCase):
         cron_log = self._cron_log()
         self.assertIn(">= 12h since last run", cron_log)
         self.assertIn("PYTHON_RAN", cron_log)
+
+    def test_run_check_skips_while_paused(self):
+        result = self._install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (self.root / "state").mkdir(exist_ok=True)
+        (self.root / "state" / "paused").touch()
+
+        result = self._run_entry()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("PYTHON_RAN", self._cron_log())
+        self.assertFalse((self.root / "state" / "last_cron_run").exists())
+
+    def _service_stubs(self) -> dict[str, str]:
+        """Stub sudo (runs its command) and systemctl (logs its arguments),
+        and a unit directory inside the temporary directory."""
+        stubs = self.root / "service-stubs"
+        stubs.mkdir()
+        (stubs / "sudo").write_text('#!/bin/sh\nexec "$@"\n', newline="\n")
+        (stubs / "systemctl").write_text(
+            '#!/bin/sh\necho "$@" >> "$(dirname "$0")/systemctl.log"\n', newline="\n"
+        )
+        for stub in (stubs / "sudo", stubs / "systemctl"):
+            stub.chmod(0o755)
+        (self.root / "units").mkdir()
+        return {"SYSTEMD_UNIT_DIR": str(self.root / "units"), "EXTRA_PATH": str(stubs)}
+
+    def test_bot_service_unit_runs_the_bot_from_the_repo(self):
+        result = self._run("install_bot_service.sh", "--print")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # By name only: Git Bash on Windows prints the path as /tmp/...
+        self.assertRegex(result.stdout, rf"WorkingDirectory=\S*/{re.escape(self.root.name)}\n")
+        self.assertIn("-m spotify_tracker.discord_bot", result.stdout)
+        self.assertIn("Restart=on-failure", result.stdout)
+        self.assertIn("RestartPreventExitStatus=2", result.stdout)
+
+    def test_bot_service_install_writes_the_unit_and_restarts_it(self):
+        env = self._service_stubs()
+        result = self._run("-c", 'PATH="$EXTRA_PATH:$PATH" bash install_bot_service.sh', env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.root / "units" / "spotify-tracker-bot.service").exists())
+        log = (self.root / "service-stubs" / "systemctl.log").read_text(encoding="utf-8")
+        self.assertIn("daemon-reload", log)
+        self.assertIn("enable spotify-tracker-bot.service", log)
+        self.assertIn("restart spotify-tracker-bot.service", log)
+
+    def test_install_cron_installs_the_bot_service_for_discord(self):
+        (self.root / "config.env").write_text('NOTIFIER="discord"\n', encoding="utf-8")
+        env = self._service_stubs()
+        # _install puts EXTRA_PATH (the service stubs) on the installer's PATH.
+        result = self._install(env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.root / "units" / "spotify-tracker-bot.service").exists())
+
+    def test_install_cron_leaves_the_bot_service_alone_for_telegram(self):
+        (self.root / "config.env").write_text("NOTIFIER=telegram\n", encoding="utf-8")
+        env = self._service_stubs()
+        result = self._install(env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.root / "units" / "spotify-tracker-bot.service").exists())
 
     def test_install_help_prints_only_the_header(self):
         result = self._run("install_cron.sh", "--help")

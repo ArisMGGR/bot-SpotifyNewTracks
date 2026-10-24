@@ -11,7 +11,7 @@ from spotify_tracker import config, setup
 TEMPLATE = (Path(__file__).resolve().parent.parent / "config.env.example").read_text(encoding="utf-8")
 
 
-class SetupTest(unittest.TestCase):
+class _SetupTestBase(unittest.TestCase):
     """Each test points config's paths at a temporary directory, so the real
     config.env is never read or written."""
 
@@ -36,17 +36,23 @@ class SetupTest(unittest.TestCase):
         return dotenv_values(self.root / "config.env")
 
     def _run(self, *, tty: bool, inputs: list[str] = (), secrets: list[str] = ()) -> mock.Mock:
+        """inputs answer the input() prompts in order, the first being the
+        Telegram-or-Discord question ("" keeps Telegram); secrets answer the
+        getpass() ones."""
         with (
             mock.patch("sys.stdin.isatty", return_value=tty),
             mock.patch("sys.stdout.isatty", return_value=tty),
             mock.patch("builtins.input", side_effect=list(inputs)),
             mock.patch("getpass.getpass", side_effect=list(secrets)),
             mock.patch.object(setup.login, "main") as login_main,
-            mock.patch("builtins.print"),
+            mock.patch("builtins.print") as printed,
         ):
             setup.main([])
+        self.printed = "\n".join(" ".join(map(str, call.args)) for call in printed.call_args_list)
         return login_main
 
+
+class SetupTest(_SetupTestBase):
     def test_creates_config_env_from_the_template(self):
         login_main = self._run(tty=False)
         self.assertEqual((self.root / "config.env").read_text(encoding="utf-8"), TEMPLATE)
@@ -69,7 +75,7 @@ class SetupTest(unittest.TestCase):
         login_main = self._run(
             tty=True,
             # client ID, chat ID, then "run the login?"
-            inputs=["new-id", "42", ""],
+            inputs=["", "new-id", "42", ""],
             secrets=["new-secret", "bot-token"],
         )
         values = self._values()
@@ -91,7 +97,7 @@ class SetupTest(unittest.TestCase):
     def test_enter_keeps_the_settings_already_set(self):
         self._write_complete_config()
         # Keep ID, secret, bot token; the chat ID is missing; keep the login.
-        login_main = self._run(tty=True, inputs=["", "", "", "7", ""])
+        login_main = self._run(tty=True, inputs=["", "", "", "", "7", ""])
         values = self._values()
         self.assertEqual(values["SPOTIFY_CLIENT_ID"], "old-id")
         self.assertEqual(values["TELEGRAM_BOT_TOKEN"], "old-bot-token-wxyz")
@@ -101,13 +107,13 @@ class SetupTest(unittest.TestCase):
     def test_a_setting_already_set_can_be_replaced(self):
         self._write_complete_config()
         # Keep ID and secret, replace the bot token, chat ID, keep the login.
-        login_main = self._run(tty=True, inputs=["", "", "n", "7", ""], secrets=["new-bot-token"])
+        login_main = self._run(tty=True, inputs=["", "", "", "n", "7", ""], secrets=["new-bot-token"])
         self.assertEqual(self._values()["TELEGRAM_BOT_TOKEN"], "new-bot-token")
         login_main.assert_not_called()
 
     def test_declining_to_replace_with_an_empty_value_keeps_the_old_one(self):
         self._write_complete_config()
-        login_main = self._run(tty=True, inputs=["n", "", "", "", "", ""])
+        login_main = self._run(tty=True, inputs=["", "n", "", "", "", "", ""])
         self.assertEqual(self._values()["SPOTIFY_CLIENT_ID"], "old-id")
         login_main.assert_not_called()
 
@@ -116,7 +122,8 @@ class SetupTest(unittest.TestCase):
         with (
             mock.patch("sys.stdin.isatty", return_value=True),
             mock.patch("sys.stdout.isatty", return_value=True),
-            mock.patch("builtins.input", side_effect=["", "", "", "7", ""]) as ask,
+            mock.patch("builtins.input", side_effect=["", "", "", "", "7", ""]) as ask,
+            mock.patch("getpass.getpass", side_effect=[]),
             mock.patch.object(setup.login, "main"),
             mock.patch("builtins.print"),
         ):
@@ -130,25 +137,114 @@ class SetupTest(unittest.TestCase):
 
     def test_declining_to_keep_the_login_runs_it_again(self):
         self._write_complete_config()
-        login_main = self._run(tty=True, inputs=["", "", "", "7", "n"])
+        login_main = self._run(tty=True, inputs=["", "", "", "", "7", "n"])
         login_main.assert_called_once()
 
     def test_new_spotify_credentials_offer_a_new_login(self):
         self._write_complete_config()
         # Replace the client ID; then the login is offered, not "keep it?".
-        login_main = self._run(tty=True, inputs=["n", "new-id", "", "", "7", ""])
+        login_main = self._run(tty=True, inputs=["", "n", "new-id", "", "", "7", ""])
         self.assertEqual(self._values()["SPOTIFY_CLIENT_ID"], "new-id")
         login_main.assert_called_once()
         self.assertEqual(os.environ["SPOTIFY_CLIENT_ID"], "new-id")
 
     def test_skipped_client_credentials_skip_the_login(self):
-        login_main = self._run(tty=True, inputs=["", ""], secrets=["", ""])
+        login_main = self._run(tty=True, inputs=["", "", ""], secrets=["", ""])
         login_main.assert_not_called()
         self.assertEqual(self._values()["SPOTIFY_CLIENT_ID"], "your_spotify_client_id")
 
     def test_declining_the_login_skips_it(self):
-        login_main = self._run(tty=True, inputs=["id", "1", "n"], secrets=["secret", "bot"])
+        login_main = self._run(tty=True, inputs=["", "id", "1", "n"], secrets=["secret", "bot"])
         login_main.assert_not_called()
+
+
+CHANNELS = [
+    {"id": "100", "name": "general", "category": ""},
+    {"id": "200", "name": "releases", "category": "Music"},
+]
+
+
+class DiscordSetupTest(_SetupTestBase):
+    """DiscordAPI is replaced, so nothing reaches Discord."""
+
+    def setUp(self):
+        super().setUp()
+        self.api = mock.Mock()
+        self.api.guild.return_value = {"id": "42", "name": "My Server"}
+        self.api.text_channels.return_value = CHANNELS
+        self.api.current_user.return_value = {"id": "555"}
+        patcher = mock.patch.object(setup, "DiscordAPI", return_value=self.api)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _write_spotify_config(self, extra: str = "") -> None:
+        (self.root / "config.env").write_text(
+            "SPOTIFY_CLIENT_ID=id\nSPOTIFY_CLIENT_SECRET=secret-abcd\nSPOTIFY_REFRESH_TOKEN=token\n" + extra,
+            encoding="utf-8",
+        )
+
+    def test_choosing_discord_asks_for_its_settings_and_a_channel(self):
+        self._write_spotify_config()
+        login_main = self._run(
+            tty=True,
+            # discord; keep ID and secret; server ID, user ID; channel 2;
+            # send the test message; keep the Spotify login.
+            inputs=["d", "", "", "42", "7", "2", "", ""],
+            secrets=["discord-token"],
+        )
+        values = self._values()
+        self.assertEqual(values["NOTIFIER"], "discord")
+        self.assertEqual(values["DISCORD_BOT_TOKEN"], "discord-token")
+        self.assertEqual(values["DISCORD_GUILD_ID"], "42")
+        self.assertEqual(values["DISCORD_USER_ID"], "7")
+        self.assertEqual(values["DISCORD_CHANNEL_ID"], "200")
+        self.api.text_channels.assert_called_once_with("42")
+        self.assertEqual(self.api.send_message.call_args.args[0], "200")
+        self.assertIn("#releases  (Music)", self.printed)
+        login_main.assert_not_called()
+
+    def _write_discord_config(self) -> None:
+        self._write_spotify_config(
+            "NOTIFIER=discord\nDISCORD_BOT_TOKEN=discord-token-wxyz\nDISCORD_GUILD_ID=42\n"
+            "DISCORD_USER_ID=7\nDISCORD_CHANNEL_ID=100\n"
+        )
+
+    def test_the_current_channel_can_be_kept(self):
+        self._write_discord_config()
+        # Keep: discord, ID, secret, token, server, user, #general, login.
+        self._run(tty=True, inputs=["", "", "", "", "", "", "", ""])
+        self.assertEqual(self._values()["DISCORD_CHANNEL_ID"], "100")
+        self.api.text_channels.assert_called_once_with("42")
+        self.api.send_message.assert_not_called()
+
+    def test_a_new_server_asks_for_a_channel_again(self):
+        self._write_discord_config()
+        # Keep up to the server, which changes to 43; then channel 1, no test.
+        self._run(tty=True, inputs=["", "", "", "", "n", "43", "", "1", "n", ""])
+        self.assertEqual(self._values()["DISCORD_GUILD_ID"], "43")
+        self.assertEqual(self._values()["DISCORD_CHANNEL_ID"], "100")
+        self.api.text_channels.assert_called_once_with("43")
+
+    def test_a_rejected_token_is_explained(self):
+        self._write_discord_config()
+        self.api.guild.side_effect = setup.DiscordError("401", status=401)
+        self._run(tty=True, inputs=["", "", "", "", "", "", ""])
+        self.assertIn("rejected the bot token", self.printed)
+
+    def test_a_bot_outside_the_server_gets_an_invite_link(self):
+        self._write_discord_config()
+        self.api.guild.side_effect = setup.DiscordError("404", status=404)
+        self._run(tty=True, inputs=["", "", "", "", "", "", ""])
+        self.assertIn("client_id=555", self.printed)
+
+    def test_missing_channel_is_listed_for_discord(self):
+        self._write_spotify_config(
+            "NOTIFIER=discord\nDISCORD_BOT_TOKEN=t\nDISCORD_GUILD_ID=42\nDISCORD_USER_ID=7\nDISCORD_CHANNEL_ID=\n"
+        )
+        self._run(tty=False)
+        self.assertIn("Still missing", self.printed)
+        self.assertIn("DISCORD_CHANNEL_ID", self.printed)
+        self.assertNotIn("TELEGRAM", self.printed)
 
 
 if __name__ == "__main__":

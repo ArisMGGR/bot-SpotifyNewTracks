@@ -10,10 +10,12 @@ from unittest import mock
 import requests
 
 from spotify_tracker import main, spotify_client
-from spotify_tracker.config import REPO_DIR
+from spotify_tracker.config import REPO_DIR, Config
+from spotify_tracker.discord_api import DiscordNotifier
 from spotify_tracker.main import check_artists, released_recently
 from spotify_tracker.spotify_client import SpotifyClient, SpotifyUnavailableError
 from spotify_tracker.state import StateStore
+from spotify_tracker.telegram import TelegramNotifier
 
 
 def _days_ago(days: int) -> str:
@@ -84,6 +86,27 @@ class _QuietProgress:
 
     def close(self):
         pass
+
+
+class MakeNotifierTest(unittest.TestCase):
+    def _config(self, notifier: str) -> Config:
+        return Config(
+            spotify_client_id="id",
+            spotify_client_secret="secret",
+            spotify_refresh_token="refresh",
+            notifier=notifier,
+            telegram_bot_token="tg",
+            telegram_chat_id="1",
+            discord_bot_token="dc",
+            discord_guild_id="2",
+            discord_user_id="3",
+            discord_channel_id="4",
+            appears_on_artists=frozenset(),
+        )
+
+    def test_picks_the_configured_notifier(self):
+        self.assertIsInstance(main.make_notifier(self._config("telegram")), TelegramNotifier)
+        self.assertIsInstance(main.make_notifier(self._config("discord")), DiscordNotifier)
 
 
 class CheckArtistsTest(unittest.TestCase):
