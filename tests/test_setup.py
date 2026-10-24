@@ -13,7 +13,9 @@ TEMPLATE = (Path(__file__).resolve().parent.parent / "config.env.example").read_
 
 class _SetupTestBase(unittest.TestCase):
     """Each test points config's paths at a temporary directory, so the real
-    config.env is never read or written."""
+    config.env is never read or written. The machine has no systemd unless a
+    test sets self.systemd, and install_bot_service.sh never really runs:
+    self.service_run records it."""
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -31,24 +33,37 @@ class _SetupTestBase(unittest.TestCase):
         patcher = mock.patch.dict(os.environ, {}, clear=True)
         patcher.start()
         self.addCleanup(patcher.stop)
+        self.unit_path = self.root / "units" / setup.BOT_SERVICE
+        self.unit_path.parent.mkdir()
+        os.environ["SYSTEMD_UNIT_DIR"] = str(self.unit_path.parent)
+        for name, attr, kwargs in (
+            ("has_systemd", "systemd", {"return_value": False}),
+            ("_run_service_script", "service_run", {"return_value": True}),
+        ):
+            patcher = mock.patch.object(setup, name, **kwargs)
+            setattr(self, attr, patcher.start())
+            self.addCleanup(patcher.stop)
 
     def _values(self) -> dict[str, str | None]:
         return dotenv_values(self.root / "config.env")
 
-    def _run(self, *, tty: bool, inputs: list[str] = (), secrets: list[str] = ()) -> mock.Mock:
+    def _run(
+        self, *, tty: bool, inputs: list[str] = (), secrets: list[str] = (), argv: list[str] = ()
+    ) -> mock.Mock:
         """inputs answer the input() prompts in order, the first being the
         Telegram-or-Discord question ("" keeps Telegram); secrets answer the
         getpass() ones."""
         with (
             mock.patch("sys.stdin.isatty", return_value=tty),
             mock.patch("sys.stdout.isatty", return_value=tty),
-            mock.patch("builtins.input", side_effect=list(inputs)),
+            mock.patch("builtins.input", side_effect=list(inputs)) as ask,
             mock.patch("getpass.getpass", side_effect=list(secrets)),
             mock.patch.object(setup.login, "main") as login_main,
             mock.patch("builtins.print") as printed,
         ):
-            setup.main([])
+            setup.main(list(argv))
         self.printed = "\n".join(" ".join(map(str, call.args)) for call in printed.call_args_list)
+        self.prompts = [call.args[0] for call in ask.call_args_list]
         return login_main
 
 
@@ -157,6 +172,23 @@ class SetupTest(_SetupTestBase):
         login_main = self._run(tty=True, inputs=["", "id", "1", "n"], secrets=["secret", "bot"])
         login_main.assert_not_called()
 
+    def test_a_bot_service_left_from_discord_can_be_removed(self):
+        self._write_complete_config()
+        self.unit_path.touch()
+        # Keep everything, chat ID 7, keep the login, then remove the service.
+        self._run(tty=True, inputs=["", "", "", "", "7", "", ""])
+        self.service_run.assert_called_once_with("--uninstall")
+
+
+class ServiceScriptTest(unittest.TestCase):
+    def test_runs_install_bot_service_with_bash_and_reports_failure(self):
+        with (
+            mock.patch.object(setup.subprocess, "run", return_value=mock.Mock(returncode=1)) as run,
+            mock.patch("builtins.print"),
+        ):
+            self.assertFalse(setup._run_service_script("--uninstall"))
+        self.assertEqual(run.call_args.args[0], ["bash", str(setup.SERVICE_SCRIPT), "--uninstall"])
+
 
 CHANNELS = [
     {"id": "100", "name": "general", "category": ""},
@@ -236,6 +268,59 @@ class DiscordSetupTest(_SetupTestBase):
         self.api.guild.side_effect = setup.DiscordError("404", status=404)
         self._run(tty=True, inputs=["", "", "", "", "", "", ""])
         self.assertIn("client_id=555", self.printed)
+
+    # Keep every setting: notifier, ID, secret, token, server, user, channel, login.
+    KEEP_ALL = [""] * 8
+
+    def test_offers_to_install_the_bot_service(self):
+        self._write_discord_config()
+        self.systemd.return_value = True
+        self._run(tty=True, inputs=self.KEEP_ALL + [""])
+        self.service_run.assert_called_once_with()
+
+    def test_the_bot_service_install_can_be_declined(self):
+        self._write_discord_config()
+        self.systemd.return_value = True
+        self._run(tty=True, inputs=self.KEEP_ALL + ["n"])
+        self.service_run.assert_not_called()
+        self.assertIn("./install_bot_service.sh", self.printed)
+
+    def test_an_installed_bot_service_is_restarted(self):
+        self._write_discord_config()
+        self.systemd.return_value = True
+        self.unit_path.touch()
+        self._run(tty=True, inputs=self.KEEP_ALL + [""])
+        self.assertIn("Restart it", self.prompts[-1])
+        self.service_run.assert_called_once_with()
+
+    def test_the_bot_service_waits_for_the_missing_settings(self):
+        # No Spotify login yet, so the bot couldn't start.
+        self._write_discord_config()
+        path = self.root / "config.env"
+        path.write_text(path.read_text(encoding="utf-8").replace("REFRESH_TOKEN=token", "REFRESH_TOKEN="), encoding="utf-8")
+        self.systemd.return_value = True
+        # Keep everything; decline the login.
+        self._run(tty=True, inputs=[""] * 7 + ["n"])
+        self.service_run.assert_not_called()
+        self.assertIn("Not starting the Discord bot service yet: SPOTIFY_REFRESH_TOKEN", self.printed)
+
+    def test_without_systemd_the_bot_is_to_be_run_by_hand(self):
+        self._write_discord_config()
+        self._run(tty=True, inputs=self.KEEP_ALL)
+        self.service_run.assert_not_called()
+        self.assertIn("no systemd", self.printed)
+
+    def test_no_bot_service_flag_skips_the_question(self):
+        self._write_discord_config()
+        self.systemd.return_value = True
+        self._run(tty=True, inputs=self.KEEP_ALL, argv=["--no-bot-service"])
+        self.service_run.assert_not_called()
+
+    def test_non_interactive_run_points_to_the_service_installer(self):
+        self._write_discord_config()
+        self.systemd.return_value = True
+        self._run(tty=False)
+        self.assertIn("isn't installed; install it with: ./install_bot_service.sh", self.printed)
 
     def test_missing_channel_is_listed_for_discord(self):
         self._write_spotify_config(

@@ -2,7 +2,8 @@
 #
 # Installs the Discord bot (python -m spotify_tracker.discord_bot) as the
 # systemd service spotify-tracker-bot.service, started now and at boot.
-# install_cron.sh runs this for you when config.env has NOTIFIER=discord.
+# python -m spotify_tracker.setup (which install_cron.sh runs) offers to run
+# this for you when you pick Discord.
 #
 # The service runs as the user who ran this script, from this directory, with
 # ./venv/bin/python (or the system python3). Afterwards:

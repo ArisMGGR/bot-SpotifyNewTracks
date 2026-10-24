@@ -8,11 +8,9 @@
 #   2. Runs the first-time setup (python -m spotify_tracker.setup): renames
 #      an old .env to config.env or creates config.env from
 #      config.env.example, and, when run from a terminal, asks for any
-#      missing settings and runs the Spotify login.
-#   3. With NOTIFIER=discord in config.env, installs the Discord bot as the
-#      systemd service spotify-tracker-bot.service (install_bot_service.sh,
-#      which asks for your sudo password).
-#   4. Installs an hourly crontab entry that runs scripts/run_check.sh, which
+#      missing settings, runs the Spotify login and, for Discord, offers to
+#      install the bot as the systemd service spotify-tracker-bot.service.
+#   3. Installs an hourly crontab entry that runs scripts/run_check.sh, which
 #      only performs a real check once ~25 hours have elapsed (see that file).
 #      The effective cadence is therefore ~25h using plain cron. Your current
 #      PATH (and CRON_INTERVAL_HOURS, if set) is saved to cron.env, which the
@@ -27,7 +25,7 @@
 #   ./install_cron.sh --uninstall  # remove the cron job (leaves venv alone)
 #   ./install_cron.sh --no-venv    # skip venv/pip, only install the cron job
 #   ./install_cron.sh --no-setup   # skip the config.env setup and login
-#   ./install_cron.sh --no-bot-service  # don't install the Discord bot service
+#   ./install_cron.sh --no-bot-service  # setup doesn't offer the Discord bot service
 #
 set -euo pipefail
 
@@ -117,6 +115,9 @@ if [ "${DO_SETUP}" -eq 1 ]; then
     if [ "${DO_VENV}" -eq 0 ]; then
         SETUP_ARGS+=(--no-venv)
     fi
+    if [ "${DO_BOT_SERVICE}" -eq 0 ]; then
+        SETUP_ARGS+=(--no-bot-service)
+    fi
     if ! (cd "${REPO_DIR}" && "${PYTHON}" -m spotify_tracker.setup ${SETUP_ARGS[@]+"${SETUP_ARGS[@]}"}); then
         echo "WARNING: setup did not finish. Re-run it with:"
         echo "           python -m spotify_tracker.setup"
@@ -124,16 +125,6 @@ if [ "${DO_SETUP}" -eq 1 ]; then
 elif [ ! -f "${REPO_DIR}/config.env" ] && [ ! -f "${REPO_DIR}/.env" ]; then
     echo "WARNING: ${REPO_DIR}/config.env not found. The scheduled run will fail"
     echo "         until you create it (python -m spotify_tracker.setup)."
-fi
-
-# The Discord bot answers commands all the time, so it runs as a service
-# rather than from cron. (.? lets the NOTIFIER value be quoted.)
-if [ "${DO_BOT_SERVICE}" -eq 1 ] \
-    && grep -Eiq '^[[:space:]]*NOTIFIER[[:space:]]*=[[:space:]]*.?discord' "${REPO_DIR}/config.env" 2>/dev/null; then
-    if ! bash "${REPO_DIR}/install_bot_service.sh"; then
-        echo "WARNING: the Discord bot service wasn't installed. Re-run it with:"
-        echo "           ./install_bot_service.sh"
-    fi
 fi
 
 # --- 4. Save the environment the scheduled run needs ------------------------

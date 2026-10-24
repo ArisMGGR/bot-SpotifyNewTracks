@@ -43,8 +43,10 @@ Discord, a bot also answers commands (`/check`, `/status`, ...) from you.
    first). It asks for `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET`, then
    for the chosen service's settings (`TELEGRAM_BOT_TOKEN` and
    `TELEGRAM_CHAT_ID`, or the Discord ones described in
-   [Discord](#discord)); press Enter to skip one. Last, it offers to run the
-   Spotify login. `./install_cron.sh` runs this step for you.
+   [Discord](#discord)); press Enter to skip one. Then it offers to run the
+   Spotify login, and for Discord, to install the bot's systemd service
+   (see [Start the bot service](#3-start-the-bot-service)).
+   `./install_cron.sh` runs this step for you.
    An existing `.env` from before the rename is renamed to `config.env`.
 
    Re-running it is safe: for each setting already in `config.env` it shows
@@ -195,13 +197,11 @@ This does the full setup in one command:
 
 1. Creates a virtualenv in `./venv` and installs `requirements.txt` into it.
 2. Runs `python -m spotify_tracker.setup` (setup step 5): creates
-   `config.env` (or renames an old `.env`), asks for any missing settings and
-   offers to run the Spotify login. Run from a non-interactive shell, it only
-   creates the file and lists what's still missing.
-3. With `NOTIFIER=discord`, installs the Discord bot as the systemd service
-   `spotify-tracker-bot.service` (see [Discord](#discord); skip it with
-   `--no-bot-service`).
-4. Installs a crontab entry that runs the check on a **~25-hour** cadence.
+   `config.env` (or renames an old `.env`), asks for any missing settings,
+   offers to run the Spotify login and, for Discord, offers to install the
+   bot service. Run from a non-interactive shell, it only creates the file
+   and lists what's still missing.
+3. Installs a crontab entry that runs the check on a **~25-hour** cadence.
 
 If the login can't finish here (a server without a browser), the cron job is
 still installed; finish the login as described in setup step 6.
@@ -214,8 +214,8 @@ This leaves the Discord bot service alone; remove that with
 `./install_bot_service.sh --uninstall`.
 
 Other flags: `--no-venv` (skip venv/pip), `--no-setup` (skip the
-`config.env` setup and login), `--no-bot-service` (don't install the Discord
-bot service), `--help`.
+`config.env` setup and login), `--no-bot-service` (the setup doesn't ask
+about the Discord bot service), `--help`.
 
 **Why 25 hours needs a wrapper.** Plain cron can't express "every 25 hours"
 — its fields are fixed clock times, so any attempt drifts. So the installed
@@ -310,8 +310,15 @@ the token or the server.
 
 ### 3. Start the bot service
 
-`./install_cron.sh` installs it for you when `NOTIFIER=discord` (it asks
-for your sudo password). To install or update just the service:
+At the end, the setup asks "Install the Discord bot as the service
+spotify-tracker-bot.service, running now and at boot? [Y/n]". Press Enter,
+then give your sudo password. If the service is already installed, it asks
+whether to restart it instead, so the bot picks up the settings you just
+changed. If settings are still missing (the Spotify login, say), it doesn't
+ask yet; run the setup again once they're in. If you switch back to
+Telegram, it offers to remove the service.
+
+To install or update just the service yourself:
 ```bash
 ./install_bot_service.sh
 ```

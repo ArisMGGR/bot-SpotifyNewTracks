@@ -18,15 +18,23 @@ Run with: python -m spotify_tracker.setup
 5. Offers the Spotify login if there is no SPOTIFY_REFRESH_TOKEN yet, or if
    the client ID or secret was just changed (the old token only works with
    the old app); otherwise asks whether to keep the existing login.
+6. On a machine with systemd: for Discord, offers to install the bot as
+   spotify-tracker-bot.service (install_bot_service.sh), or to restart it so
+   it picks up the settings if it is installed already. For Telegram, offers
+   to remove a bot service left from an earlier Discord setup.
+   --no-bot-service skips this step.
 
-With --non-interactive (or when not run from a terminal) steps 2 to 5 are
+With --non-interactive (or when not run from a terminal) steps 2 to 6 are
 skipped, and the settings still missing are listed.
 """
 
 import argparse
 import getpass
+import os
 import shutil
+import subprocess
 import sys
+from pathlib import Path
 
 if __name__ == "__main__":
     # Before the imports below, which need the dependencies installed.
@@ -61,6 +69,9 @@ NOTIFIER_PROMPTS = {
 
 # The template's stand-in values all start with this.
 PLACEHOLDER_PREFIX = "your_"
+
+BOT_SERVICE = "spotify-tracker-bot.service"
+SERVICE_SCRIPT = config.REPO_DIR / "install_bot_service.sh"
 
 
 def _is_missing(value: str | None) -> bool:
@@ -229,6 +240,54 @@ def maybe_run_login(changed: set[str] = frozenset()) -> None:
     login.main()
 
 
+def has_systemd() -> bool:
+    # The check sd_booted() makes: this directory exists only under systemd.
+    return shutil.which("systemctl") is not None and Path("/run/systemd/system").is_dir()
+
+
+def bot_service_installed() -> bool:
+    # SYSTEMD_UNIT_DIR as in install_bot_service.sh, which the tests point elsewhere.
+    unit_dir = Path(os.environ.get("SYSTEMD_UNIT_DIR") or "/etc/systemd/system")
+    return (unit_dir / BOT_SERVICE).exists()
+
+
+def _run_service_script(*args: str) -> bool:
+    """Runs install_bot_service.sh, which uses sudo and may ask for a password."""
+    print(f"Running {' '.join([SERVICE_SCRIPT.name, *args])} (it may ask for your sudo password) ...", flush=True)
+    return subprocess.run(["bash", str(SERVICE_SCRIPT), *args], cwd=config.REPO_DIR).returncode == 0
+
+
+def maybe_install_bot_service(notifier: str) -> None:
+    """Offers to install (or restart) the Discord bot service, or to remove it
+    once alerts go to Telegram."""
+    installed = bot_service_installed()
+    if notifier != "discord":
+        question = f"Alerts go to Telegram, but the Discord bot service ({BOT_SERVICE}) is still installed. Remove it? [Y/n]: "
+        if installed and _yes(question):
+            if not _run_service_script("--uninstall"):
+                print(f"Removing it failed; try again with: ./{SERVICE_SCRIPT.name} --uninstall")
+        return
+
+    if not has_systemd():
+        print("The Discord bot runs as a systemd service, and this machine has no systemd.")
+        print("Run it yourself instead: python -m spotify_tracker.discord_bot")
+        return
+    missing = missing_settings()
+    if missing:
+        print(f"Not starting the Discord bot service yet: {', '.join(missing)} still missing.")
+        return
+
+    if installed:
+        question = f"The Discord bot service ({BOT_SERVICE}) is installed. Restart it so it uses these settings? [Y/n]: "
+    else:
+        question = f"Install the Discord bot as the service {BOT_SERVICE}, running now and at boot? [Y/n]: "
+    if not _yes(question):
+        print(f"Skipped. Do it later with: ./{SERVICE_SCRIPT.name}")
+        return
+    if not _run_service_script():
+        print(f"The bot service wasn't installed; try again with: ./{SERVICE_SCRIPT.name}")
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -241,17 +300,25 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="use this Python as it is instead of ./venv (its dependencies must be installed)",
     )
+    parser.add_argument(
+        "--no-bot-service",
+        action="store_true",
+        help="don't offer to install, restart or remove the Discord bot's systemd service",
+    )
     args = parser.parse_args(argv)
 
     ensure_config_file()
     # Both ends, not just stdin: Windows reports NUL (stdin from /dev/null) as
     # a terminal, and getpass there reads the console directly and would hang.
-    if not args.non_interactive and sys.stdin.isatty() and sys.stdout.isatty():
+    interactive = not args.non_interactive and sys.stdin.isatty() and sys.stdout.isatty()
+    if interactive:
         notifier = choose_notifier()
         changed = prompt_for_settings(notifier)
         if notifier == "discord":
             pick_discord_channel(changed)
         maybe_run_login(changed)
+        if not args.no_bot_service:
+            maybe_install_bot_service(notifier)
 
     missing = missing_settings()
     if missing:
@@ -261,6 +328,14 @@ def main(argv: list[str] | None = None) -> None:
         )
     else:
         print(f"{config.ENV_PATH} is complete.")
+    if (
+        not interactive
+        and not args.no_bot_service
+        and _notifier(dotenv_values(config.ENV_PATH)) == "discord"
+        and has_systemd()
+        and not bot_service_installed()
+    ):
+        print(f"The Discord bot service isn't installed; install it with: ./{SERVICE_SCRIPT.name}")
 
 
 if __name__ == "__main__":

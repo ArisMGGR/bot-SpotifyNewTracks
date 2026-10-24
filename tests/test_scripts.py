@@ -200,20 +200,20 @@ class ShellScriptTest(unittest.TestCase):
         self.assertIn("enable spotify-tracker-bot.service", log)
         self.assertIn("restart spotify-tracker-bot.service", log)
 
-    def test_install_cron_installs_the_bot_service_for_discord(self):
-        (self.root / "config.env").write_text('NOTIFIER="discord"\n', encoding="utf-8")
+    def test_install_cron_leaves_the_bot_service_to_the_setup(self):
+        # The setup asks about the service itself; the installer only passes
+        # --no-bot-service on, and never installs it on its own.
+        (self.root / "config.env").write_text("NOTIFIER=discord\n", encoding="utf-8")
         env = self._service_stubs()
         # _install puts EXTRA_PATH (the service stubs) on the installer's PATH.
-        result = self._install(env=env)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue((self.root / "units" / "spotify-tracker-bot.service").exists())
-
-    def test_install_cron_leaves_the_bot_service_alone_for_telegram(self):
-        (self.root / "config.env").write_text("NOTIFIER=telegram\n", encoding="utf-8")
-        env = self._service_stubs()
-        result = self._install(env=env)
+        result = self._install(env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.root / "units" / "spotify-tracker-bot.service").exists())
+
+    def test_install_cron_passes_no_bot_service_to_the_setup(self):
+        result = self._install(None, "--no-bot-service")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("PYTHON_RAN -m spotify_tracker.setup --no-venv --no-bot-service", result.stdout)
 
     def test_install_help_prints_only_the_header(self):
         result = self._run("install_cron.sh", "--help")
